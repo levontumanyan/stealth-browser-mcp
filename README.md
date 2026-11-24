@@ -5,7 +5,7 @@
 ![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)
 ![uv](https://img.shields.io/badge/powered%20by-uv-%231284da)
 
-Stealth browser automation for AI coding agents on macOS — an MCP server (`stealth-browser`), a transcript-driven audit CLI (`stealth-browser-audit`), and a Postgres telemetry shipper (`stealth-browser-shipper`).
+Stealth browser automation for AI coding agents on macOS — an MCP server (`stealth-browser`) and a transcript-driven audit CLI (`stealth-browser-audit`).
 
 Every tool in `bin/` is a self-contained PEP 723 `uv run --script` executable with auto-generated `--help`, zero global Python pollution, and instant startup.
 
@@ -59,10 +59,9 @@ Use the absolute path to your local checkout (avoid `~` in JSON).
 
 Headless by default; keep it that way and use `wait_for_human()` for interactive login/2FA/CAPTCHA.
 
-# Audit & Telemetry
+# Audit
 
 - `stealth-browser-audit [--since 14d] [--session <sid-prefix>] [--diff <baseline.json>]` — mine local AGY and OpenCode transcripts for stealth-browser usage, error rates, latency, and workarounds; produces a prioritized improvement plan or before/after scorecard.
-- `stealth-browser-shipper [--once] [--full] [--dry-run]` — syncs audit records into `Antigravity_Postgres` (`mcp_audit_sessions` / `mcp_audit_calls`) every 5 minutes via the `com.levon.stealth-browser-audit-shipper` LaunchAgent, backing the Grafana "MCP Observability" dashboard.
 
 # Tests
 
