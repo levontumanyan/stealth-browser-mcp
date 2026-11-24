@@ -198,7 +198,7 @@ def test_switch_and_close_tab_accept_stable_tab_ids(isolated_session):
 		assert f"No open tab with id 't99'" in await sb.close_tab(tab="t99")
 
 		res_close = await sb.close_tab(tab=id1)
-		assert f"Closed tab [0] (https://a.example). Remaining open tabs: 1" in res_close
+		assert f"Closed tab [0] ({id1}) (https://a.example). Remaining open tabs: 1" in res_close
 		assert p1.is_closed()
 
 		res_after = await sb.switch_tab(tab=id2)

@@ -584,12 +584,14 @@ def test_close_tab_timeout_and_param_aliases(sb, monkeypatch):
 		get_pages_mock = AsyncMock(side_effect=[[p0, p1], [p0], [p0, p1], [p0]])
 		monkeypatch.setattr(sb.session, "get_pages", get_pages_mock)
 
+		tid_tab = sb.session.get_tab_id(p1)
 		res_tab = await sb.close_tab(tab=1)
-		assert "Closed tab [1] (https://b.example)" in res_tab
+		assert f"Closed tab [1] ({tid_tab}) (https://b.example)" in res_tab
 
 		p1._closed = False
+		tid_index = sb.session.get_tab_id(p1)
 		res_index = await sb.close_tab(index=1)
-		assert "Closed tab [1] (https://b.example)" in res_index
+		assert f"Closed tab [1] ({tid_index}) (https://b.example)" in res_index
 
 		close_browser_mock = AsyncMock(return_value="closed all")
 		monkeypatch.setattr(sb, "close_browser", close_browser_mock)

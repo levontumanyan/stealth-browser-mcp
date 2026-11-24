@@ -4284,6 +4284,7 @@ async def close_tab(tab: Union[int, str, None] = None, index: Optional[int] = No
 			target_index = target
 
 		url = page.url
+		tab_id = session.get_tab_id(page)
 		try:
 			await asyncio.wait_for(keep_alive_mgr.stop(page), timeout=CDP_OP_TIMEOUT_S)
 		except Exception:
@@ -4309,8 +4310,8 @@ async def close_tab(tab: Union[int, str, None] = None, index: Optional[int] = No
 			session._active_page = remaining[-1] if remaining else None
 		if not remaining:
 			await close_browser()
-			return f"Closed last tab [{target_index}] ({url}). Browser window completely closed."
-		return f"Closed tab [{target_index}] ({url}). Remaining open tabs: {len(remaining)}"
+			return f"Closed last tab [{target_index}] ({tab_id}) ({url}). Browser window completely closed."
+		return f"Closed tab [{target_index}] ({tab_id}) ({url}). Remaining open tabs: {len(remaining)}"
 	except asyncio.TimeoutError:
 		return f"Error closing tab [{target}]: Timed out"
 	except Exception as exc:
