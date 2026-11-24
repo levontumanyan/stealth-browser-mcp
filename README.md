@@ -1,5 +1,10 @@
 # stealth-browser-mcp
 
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![tests](https://github.com/levontumanyan/stealth-browser-mcp/actions/workflows/tests.yml/badge.svg)](https://github.com/levontumanyan/stealth-browser-mcp/actions/workflows/tests.yml)
+![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)
+![uv](https://img.shields.io/badge/powered%20by-uv-%231284da)
+
 Stealth browser automation for AI coding agents on macOS — an MCP server (`stealth-browser`), a transcript-driven audit CLI (`stealth-browser-audit`), and a Postgres telemetry shipper (`stealth-browser-shipper`).
 
 Every tool in `bin/` is a self-contained PEP 723 `uv run --script` executable with auto-generated `--help`, zero global Python pollution, and instant startup.

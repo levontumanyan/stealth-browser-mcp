@@ -1,0 +1,15 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Run test suite
+        run: uv run --with pytest --with adblock --with 'mcp<2' --with patchright --with 'psycopg[binary]>=3.2' pytest tests/ -q
