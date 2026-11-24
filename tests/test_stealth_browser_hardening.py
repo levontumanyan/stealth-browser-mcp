@@ -567,12 +567,18 @@ def test_close_tab_timeout_and_param_aliases(sb, monkeypatch):
 
 		p1.close_impl = hang_close
 		monkeypatch.setattr(sb.session, "get_pages", AsyncMock(return_value=[p0, p1]))
+		monkeypatch.setattr(sb.session, "close", AsyncMock(return_value=None))
+		monkeypatch.setattr(sb, "_force_kill_browser_processes", lambda: None)
+		monkeypatch.setattr(sb.session, "_probe_cdp_ready", lambda: False)
 
 		res_timeout = await sb.close_tab(tab=1)
 		assert "Error closing tab [1]: renderer unresponsive" in res_timeout
 		assert "force-restarted" in res_timeout
-		monkeypatch.setattr(sb, "_force_kill_browser_processes", lambda: None)
-		monkeypatch.setattr(sb.session, "close", AsyncMock(return_value=None))
+
+		monkeypatch.setattr(sb.session, "_probe_cdp_ready", lambda: True)
+		monkeypatch.setattr(sb.session, "get_pages", AsyncMock(return_value=[p0, p1]))
+		res_reachable = await sb.close_tab(tab=1)
+		assert "browser still reachable, try restart_browser" in res_reachable
 
 		p1.close_impl = None
 		get_pages_mock = AsyncMock(side_effect=[[p0, p1], [p0], [p0, p1], [p0]])
