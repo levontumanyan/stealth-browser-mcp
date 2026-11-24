@@ -31,7 +31,7 @@ Launch via `invoke_subagent` with `Model: "flash"` for routine navigation, porta
 Add `stealth-browser` via the CLI:
 
 ```sh
-opencode mcp add --global stealth-browser -- uv run --script /Users/<username>/repos/agent-tools/bin/stealth-browser
+opencode mcp add --global stealth-browser -- uv run --script /Users/<username>/repos/stealth-browser-mcp/bin/stealth-browser
 ```
 
 Or edit `~/.config/opencode/opencode.jsonc` (or `~/.config/opencode/opencode.json`) directly. OpenCode v2 registers servers under `mcp.servers.<name>` with `type: "local"` and an array `command` (top-level `mcp.<name>` is deprecated in `https://opencode.ai/config.json`):
@@ -47,7 +47,7 @@ Or edit `~/.config/opencode/opencode.jsonc` (or `~/.config/opencode/opencode.jso
 					"uv",
 					"run",
 					"--script",
-					"/Users/<username>/repos/agent-tools/bin/stealth-browser"
+					"/Users/<username>/repos/stealth-browser-mcp/bin/stealth-browser"
 				],
 				"environment": {
 					"STEALTH_BROWSER_HEADLESS": "true"
@@ -60,7 +60,7 @@ Or edit `~/.config/opencode/opencode.jsonc` (or `~/.config/opencode/opencode.jso
 
 ## Notes
 
-- Replace `/Users/<username>/repos/agent-tools/bin/stealth-browser` with the absolute path to your local checkout (avoid `~` in JSON).
+- Replace `/Users/<username>/repos/stealth-browser-mcp/bin/stealth-browser` with the absolute path to your local checkout (avoid `~` in JSON).
 - If OpenCode is launched from a GUI without your shell `PATH`, replace `"uv"` with its absolute path (for example `/opt/homebrew/bin/uv` or `/Users/<username>/.local/bin/uv`).
 - Servers under `mcp.servers` are enabled by default (set `"disabled": true` to disable; `"enabled"` is only used in the deprecated top-level `mcp.<name>` format).
 - Optional environment overrides under `environment`:

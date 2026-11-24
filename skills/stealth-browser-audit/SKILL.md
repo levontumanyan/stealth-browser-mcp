@@ -1,12 +1,12 @@
 ---
 name: stealth-browser-audit
-description: Audit local AGY transcripts and OpenCode databases for stealth-browser usage, errors, slow/hung calls, context bloat, and evaluate_js workarounds, then correlate findings against ~/repos/agent-tools/bin/stealth-browser to produce a prioritized improvement plan or before/after scorecard.
+description: Audit local AGY transcripts and OpenCode databases for stealth-browser usage, errors, slow/hung calls, context bloat, and evaluate_js workarounds, then correlate findings against ~/repos/stealth-browser-mcp/bin/stealth-browser to produce a prioritized improvement plan or before/after scorecard.
 user_invocable: true
 ---
 
 # Stealth-Browser Usage Audit
 
-Use `stealth-browser-audit` (in `~/repos/agent-tools/bin/stealth-browser-audit`) to mine real browser sessions and turn empirical pain points into concrete upgrades for `~/repos/agent-tools/bin/stealth-browser`.
+Use `stealth-browser-audit` (in `~/repos/stealth-browser-mcp/bin/stealth-browser-audit`) to mine real browser sessions and turn empirical pain points into concrete upgrades for `~/repos/stealth-browser-mcp/bin/stealth-browser`.
 
 ## Workflow
 
@@ -24,8 +24,8 @@ Use `stealth-browser-audit` (in `~/repos/agent-tools/bin/stealth-browser-audit`)
    - Report the before/after scorecard: `evaluate_js` share, overall & per-tool error rates (`click`, `status`, `navigate`), 3m MCP timeouts / 1k calls, slow non-timeout calls / 1k calls, validation errors / 1k calls, schema JSON reads/session, and median calls & output chars/session.
    - Flag any regressed KPIs immediately.
 
-3. **Correlate top failure modes and workarounds directly against `~/repos/agent-tools/bin/stealth-browser`**:
-   - Read the relevant tool implementations in `~/repos/agent-tools/bin/stealth-browser` (do not guess from memory).
+3. **Correlate top failure modes and workarounds directly against `~/repos/stealth-browser-mcp/bin/stealth-browser`**:
+   - Read the relevant tool implementations in `~/repos/stealth-browser-mcp/bin/stealth-browser` (do not guess from memory).
    - Map each major signal to its exact code path:
      - **High `evaluate_js` intents** (`js_click_workaround`, `extract_text_targeted`, `extract_links`, `shadow_or_iframe`, `wait_or_poll_hack`, `download_or_pdf_hack`, `console_perf_network`) -> check whether a missing parameter, locator gap, or dedicated tool eliminates repeated JS snippets.
      - **Per-tool error root causes** (`click` overlay/hidden/locator timeout, `status` 3m hang / unresponsive tab / disconnect, `navigate` `net::ERR_*` or timeout) -> trace timeouts, CDP calls, and retry/fallback behavior in `BrowserSessionManager` and tool handlers.
@@ -36,6 +36,6 @@ Use `stealth-browser-audit` (in `~/repos/agent-tools/bin/stealth-browser-audit`)
    - Group into **P0 (Reliability / Hangs)**, **P1 (High-Frequency Workarounds & Error Rates)**, and **P2 (Context Efficiency & Ergonomics)**.
    - For every item include:
      - Exact metric & sample evidence from the audit (counts, %, affected sessions/domains).
-     - Exact file + line/function in `~/repos/agent-tools/bin/stealth-browser`.
+     - Exact file + line/function in `~/repos/stealth-browser-mcp/bin/stealth-browser`.
      - Concrete proposed change and the audit KPI it should move on the next `--diff` run.
    - Offer to save a fresh baseline (`--save-baseline`) before implementing changes if none exists.
