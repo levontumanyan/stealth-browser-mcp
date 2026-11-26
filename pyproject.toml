@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [project.scripts]
-stealth-browser = "stealth_browser:main"
+stealth-browser = "stealth_browser_cli:main"
 
 [project.urls]
 Homepage = "https://github.com/levontumanyan/stealth-browser-mcp"
@@ -35,5 +35,5 @@ dev = [
 path = "bin/stealth_browser.py"
 
 [tool.hatch.build.targets.wheel]
-only-include = ["bin/stealth_browser.py"]
+only-include = ["bin/stealth_browser.py", "bin/stealth_browser_cli.py"]
 sources = ["bin"]

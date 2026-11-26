@@ -355,3 +355,73 @@ def test_standalone_mode_runs_in_process_without_spawning_daemon():
 		lines = [json.loads(line) for line in res.stdout.splitlines() if line.strip()]
 		assert any(m.get("id") == 1 and "result" in m for m in lines)
 		assert not os.path.exists(paths["sock_path"])
+
+
+def test_cli_shim_fast_path_skips_heavy_imports_and_heavy_flags_delegate():
+	cli_script = ROOT / "bin" / "stealth_browser_cli.py"
+	with _short_runtime_dir() as td:
+		probe_code = (
+			"import runpy, sys\n"
+			f"sys.argv = [{str(cli_script)!r}, '--daemon-status']\n"
+			"try:\n"
+			f"    runpy.run_path({str(cli_script)!r}, run_name='__main__')\n"
+			"except SystemExit:\n"
+			"    pass\n"
+			"loaded = [m for m in ('stealth_browser', 'mcp', 'patchright', 'adblock') if m in sys.modules]\n"
+			"print('LOADED:' + ','.join(loaded))\n"
+		)
+		env = _isolated_env(td, os.path.join(td, "tok"))
+		res = subprocess.run(
+			[sys.executable, "-c", probe_code],
+			capture_output=True,
+			text=True,
+			env=env,
+			timeout=15,
+		)
+		assert res.returncode == 0, res.stderr
+		assert res.stdout.rstrip().endswith("LOADED:")
+
+		help_res = subprocess.run(
+			[sys.executable, str(cli_script), "--help"],
+			capture_output=True,
+			text=True,
+			timeout=15,
+		)
+		assert help_res.returncode == 0
+		assert "--serve" in help_res.stdout and "--standalone" in help_res.stdout
+
+
+def test_daemon_paths_af_unix_length_fallback_and_secure_dir():
+	long_rdir = "/tmp/" + ("a" * 95)
+	paths = sb._daemon_paths(cdp_port=19227, profile_dir="/tmp/prof", runtime_dir=long_rdir)
+	assert len(paths["sock_path"].encode("utf-8")) <= 100
+	assert paths["runtime_dir"] == f"/tmp/sb-{os.getuid()}"
+
+	other_long_rdir = "/tmp/" + ("b" * 95)
+	paths2 = sb._daemon_paths(cdp_port=19227, profile_dir="/tmp/prof", runtime_dir=other_long_rdir)
+	assert paths2["sock_path"] != paths["sock_path"]
+
+	with _short_runtime_dir() as td:
+		target = os.path.join(td, "real")
+		os.makedirs(target, mode=0o700)
+		link = os.path.join(td, "link")
+		os.symlink(target, link)
+		with pytest.raises(PermissionError):
+			sb._ensure_secure_runtime_dir(link)
+
+
+def test_proxy_dynamic_timeout_for_wait_for_human():
+	proxy = sb._StdioUdsProxy("/tmp/nonexistent.sock", request_timeout=300.0)
+	assert proxy._timeout_for_request("tools/list", {"method": "tools/list"}) == 300.0
+	assert proxy._timeout_for_request(
+		"tools/call",
+		{"method": "tools/call", "params": {"name": "navigate", "arguments": {"url": "https://example.com"}}},
+	) == 300.0
+	assert proxy._timeout_for_request(
+		"tools/call",
+		{"method": "tools/call", "params": {"name": "wait_for_human", "arguments": {"timeout_s": 180}}},
+	) == 300.0
+	assert proxy._timeout_for_request(
+		"tools/call",
+		{"method": "tools/call", "params": {"name": "wait_for_human", "arguments": {"timeout_s": 600}}},
+	) == 630.0

@@ -5,6 +5,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "bin" / "stealth-browser"
 MODULE = ROOT / "bin" / "stealth_browser.py"
+CLI_MODULE = ROOT / "bin" / "stealth_browser_cli.py"
 PYPROJECT = ROOT / "pyproject.toml"
 
 
@@ -32,7 +33,8 @@ def test_pep723_metadata_matches_pyproject():
 	assert 'requires-python = ">=3.11"' in block
 	assert 'requires-python = ">=3.11"' in pyproject
 	assert 'name = "stealthmcp"' in pyproject
-	assert 'stealth-browser = "stealth_browser:main"' in pyproject
+	assert 'stealth-browser = "stealth_browser_cli:main"' in pyproject
+	assert '"bin/stealth_browser_cli.py"' in pyproject
 
 
 def test_version_is_single_source():
@@ -40,6 +42,8 @@ def test_version_is_single_source():
 	version = re.search(r'^__version__ = "([^"]+)"', script, re.MULTILINE)
 	assert version, "__version__ missing"
 	assert version.group(1) == "0.1.0"
+	cli_version = re.search(r'^__version__ = "([^"]+)"', CLI_MODULE.read_text(encoding="utf-8"), re.MULTILINE)
+	assert cli_version and cli_version.group(1) == version.group(1)
 	assert "__version__" not in PYPROJECT.read_text(encoding="utf-8"), "version must come from the script only"
 
 
