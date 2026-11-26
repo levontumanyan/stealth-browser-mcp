@@ -2,7 +2,6 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-# 	"adblock==0.6.0",
 # 	"mcp==1.30.0",
 # 	"patchright==1.64.4",
 # ]
@@ -532,7 +531,7 @@ def _run_cli_fast_path() -> int:
 		return 0
 
 
-# Fast-path exits before importing adblock/mcp/patchright so default stdio proxy stays lightweight.
+# Fast-path exits before importing mcp/patchright so default stdio proxy stays lightweight.
 if _is_cli_fast_path():
 	raise SystemExit(_run_cli_fast_path())
 
@@ -557,7 +556,6 @@ import zipfile
 from collections import deque
 from typing import Union
 from urllib.parse import urlparse
-from adblock import Engine, FilterSet
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from patchright.async_api import Browser, BrowserContext, Page, async_playwright
@@ -965,10 +963,7 @@ TRACKER_BLOCK_URL_PATTERNS = (
 )
 
 CACHE_DIR = os.path.expanduser("~/.cache/stealth-browser")
-CACHE_FILE = os.path.join(CACHE_DIR, "easyprivacy.txt")
-CACHE_BIN_FILE = os.path.join(CACHE_DIR, "easyprivacy.bin")
 STATE_FILE = os.path.join(CACHE_DIR, f"state-{CDP_PORT}.json")
-EASYPRIVACY_URL = "https://easylist.to/easylist/easyprivacy.txt"
 
 
 def _load_persisted_headless() -> bool:
@@ -1056,11 +1051,6 @@ def _save_persisted_animations(enabled: Optional[bool]) -> None:
 		pass
 
 
-_adblock_engine: Optional[Engine] = None
-_adblock_initialized: bool = False
-_adblock_load_task: Optional[asyncio.Task] = None
-
-
 def _acquire_file_lock(lock_file, timeout_s: float = 15.0) -> None:
 	deadline = time.monotonic() + timeout_s
 	while True:
@@ -1081,170 +1071,6 @@ def _resolve_apple_passwords_ext_locked() -> Optional[str]:
 			return _install_apple_passwords_ext()
 		finally:
 			fcntl.flock(lock_file, fcntl.LOCK_UN)
-
-
-def _load_or_build_engine() -> Optional[Engine]:
-	"""Load cached binary engine or compile EasyPrivacy into Brave's adblock-rust engine."""
-	os.makedirs(CACHE_DIR, exist_ok=True)
-
-	if os.path.exists(CACHE_BIN_FILE):
-		try:
-			if (time.time() - os.path.getmtime(CACHE_BIN_FILE)) < (7 * 86400):
-				engine = Engine(filter_set=FilterSet())
-				engine.deserialize_from_file(CACHE_BIN_FILE)
-				return engine
-		except Exception:
-			pass
-
-	content = None
-	if os.path.exists(CACHE_FILE):
-		try:
-			if (time.time() - os.path.getmtime(CACHE_FILE)) < (7 * 86400):
-				with open(CACHE_FILE, "r", encoding="utf-8") as f:
-					content = f.read()
-		except Exception:
-			content = None
-
-	if not content:
-		try:
-			req = urllib.request.Request(EASYPRIVACY_URL, headers={"User-Agent": "Mozilla/5.0"})
-			with urllib.request.urlopen(req, timeout=5) as resp:
-				content = resp.read().decode("utf-8", errors="ignore")
-			with open(CACHE_FILE, "w", encoding="utf-8") as f:
-				f.write(content)
-		except Exception:
-			if os.path.exists(CACHE_FILE):
-				try:
-					with open(CACHE_FILE, "r", encoding="utf-8") as f:
-						content = f.read()
-				except Exception:
-					content = None
-
-	if content:
-		try:
-			filters = FilterSet()
-			filters.add_filter_list(content)
-			engine = Engine(filter_set=filters)
-			try:
-				engine.serialize_to_file(CACHE_BIN_FILE)
-			except Exception:
-				pass
-			return engine
-		except Exception:
-			pass
-	return None
-
-
-async def _warm_adblock_engine() -> Optional[Engine]:
-	global _adblock_engine, _adblock_initialized, _adblock_load_task
-	if _adblock_initialized:
-		return _adblock_engine
-	try:
-		_adblock_engine = await asyncio.to_thread(_load_or_build_engine)
-	except asyncio.CancelledError:
-		raise
-	except Exception:
-		_adblock_engine = None
-		_adblock_initialized = True
-	else:
-		_adblock_initialized = True
-	finally:
-		_adblock_load_task = None
-	return _adblock_engine
-
-
-def _schedule_adblock_warmup() -> Optional[asyncio.Task]:
-	global _adblock_load_task
-	if _adblock_initialized:
-		return None
-	if _adblock_load_task is not None and not _adblock_load_task.done():
-		return _adblock_load_task
-	try:
-		loop = asyncio.get_running_loop()
-	except RuntimeError:
-		return None
-	_adblock_load_task = loop.create_task(_warm_adblock_engine())
-	return _adblock_load_task
-
-
-def get_adblock_engine() -> Optional[Engine]:
-	global _adblock_engine, _adblock_initialized
-	if _adblock_initialized:
-		return _adblock_engine
-	if _schedule_adblock_warmup() is not None:
-		return _adblock_engine
-	_adblock_initialized = True
-	_adblock_engine = _load_or_build_engine()
-	return _adblock_engine
-
-
-async def _network_route_handler(route, request):
-	"""Intercepts network requests: evaluates trackers against EasyPrivacy and blocks media when enabled."""
-	handled = False
-	try:
-		frame = None
-		try:
-			frame = request.frame
-		except Exception:
-			frame = None
-
-		if frame is None:
-			handled = True
-			await route.continue_()
-			return
-
-		url = request.url
-		try:
-			frame_url = frame.url or ""
-		except Exception:
-			frame_url = ""
-		res_type = request.resource_type or "other"
-
-		if res_type == "document":
-			is_main_frame = True
-			try:
-				is_main_frame = frame.parent_frame is None
-			except Exception:
-				is_main_frame = True
-			uncommitted = (not frame_url.strip()) or frame_url.strip().lower() == "about:blank"
-			if is_main_frame or uncommitted:
-				handled = True
-				await route.continue_()
-				return
-
-		engine = get_adblock_engine()
-		if engine is not None:
-			try:
-				if engine.check_network_urls(url, frame_url, res_type).matched:
-					handled = True
-					await route.abort()
-					return
-			except Exception:
-				pass
-
-		try:
-			page = frame.page
-		except Exception:
-			page = None
-		if page and getattr(page, "_media_blocked", False):
-			if res_type in MEDIA_RESOURCE_TYPES:
-				handled = True
-				await route.abort()
-				return
-			url_clean = url.split("?")[0].lower()
-			if url_clean.endswith(MEDIA_FILE_EXTENSIONS):
-				handled = True
-				await route.abort()
-				return
-
-		handled = True
-		await route.continue_()
-	except Exception:
-		if not handled:
-			try:
-				await route.continue_()
-			except Exception:
-				pass
 
 
 class NetworkBlockManager:
@@ -5970,7 +5796,7 @@ def _doctor(smoke: bool = False) -> int:
 	try:
 		from importlib.metadata import version as _dist_version
 
-		deps = {name: _dist_version(name) for name in ("adblock", "mcp", "patchright")}
+		deps = {name: _dist_version(name) for name in ("mcp", "patchright")}
 		deps_ok = deps["mcp"] == "1.30.0"
 		checks.append(("Dependencies", deps_ok, ", ".join(f"{k}={v}" for k, v in deps.items())))
 	except Exception as exc:

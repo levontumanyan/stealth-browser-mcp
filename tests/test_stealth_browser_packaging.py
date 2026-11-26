@@ -25,9 +25,11 @@ def test_pep723_metadata_matches_pyproject():
 	block = metadata.group(1)
 	pyproject = PYPROJECT.read_text(encoding="utf-8")
 
-	for package in ("adblock==0.6.0", "mcp==1.30.0", "patchright==1.64.4"):
+	for package in ("mcp==1.30.0", "patchright==1.64.4"):
 		assert package in block, f"{package} missing from PEP 723 block"
 		assert package in pyproject, f"{package} missing from pyproject.toml"
+	assert "adblock" not in block
+	assert "adblock" not in pyproject
 
 	assert 'requires-python = ">=3.11"' in block
 	assert 'requires-python = ">=3.11"' in pyproject

@@ -102,7 +102,7 @@ def test_fast_path_skips_heavy_imports():
 			f"    runpy.run_path({str(SCRIPT)!r}, run_name='__main__')\n"
 			"except SystemExit:\n"
 			"    pass\n"
-			"loaded = [m for m in ('mcp', 'patchright', 'adblock') if m in sys.modules]\n"
+			"loaded = [m for m in ('mcp', 'patchright') if m in sys.modules]\n"
 			"print('LOADED:' + ','.join(loaded))\n"
 		)
 		env = _isolated_env(td, os.path.join(td, "tok"))
