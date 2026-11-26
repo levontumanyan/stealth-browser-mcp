@@ -16,6 +16,7 @@ import asyncio
 import base64
 import collections
 import contextlib
+import contextvars
 import datetime
 import fcntl
 import functools
@@ -34,12 +35,13 @@ import sys
 import tempfile
 import time
 import urllib.request
+import weakref
 import zipfile
 from collections import deque
 from typing import Any, Optional, Union
 from urllib.parse import urlparse
 from adblock import Engine, FilterSet
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 from patchright.async_api import Browser, BrowserContext, Page, async_playwright
 
 try:
@@ -903,6 +905,46 @@ class NetworkBlockManager:
 network_blocker = NetworkBlockManager()
 
 
+_in_lifecycle_op: contextvars.ContextVar[bool] = contextvars.ContextVar("_in_lifecycle_op", default=False)
+
+
+def _session_key(ctx: Optional[Context] = None) -> str:
+	if ctx is None:
+		return "default"
+	try:
+		req_ctx = getattr(ctx, "request_context", None)
+		req = getattr(req_ctx, "request", None) if req_ctx is not None else None
+		headers = getattr(req, "headers", None) if req is not None else None
+		if headers is not None:
+			sid = headers.get("mcp-session-id") or headers.get("Mcp-Session-Id")
+			if sid:
+				return f"http:{sid}"
+	except Exception:
+		pass
+	try:
+		cid = getattr(ctx, "client_id", None)
+		if cid:
+			return f"client:{cid}"
+	except Exception:
+		pass
+	try:
+		sess = getattr(ctx, "session", None)
+		if sess is not None:
+			key = f"session:{id(sess)}"
+			session.register_client_session(key, sess)
+			return key
+	except Exception:
+		pass
+	return "default"
+
+
+async def _resolve_page(tab: Union[int, str] = -1, ctx: Optional[Context] = None) -> Page:
+	client_key = _session_key(ctx)
+	if client_key == "default":
+		return await session.resolve_page(tab)
+	return await session.resolve_page(tab, client_key=client_key)
+
+
 class BrowserSessionManager:
 	"""Manages dedicated stealth Chromium browser or CDP connection for AI agents."""
 
@@ -913,11 +955,81 @@ class BrowserSessionManager:
 		self._playwright = None
 		self._browser: Optional[Browser] = None
 		self._context: Optional[BrowserContext] = None
-		self._active_page: Optional[Page] = None
+		self._active_pages: dict[str, Page] = {}
+		self._client_finalizers: dict[str, weakref.finalize] = {}
+		self._connect_lock: asyncio.Lock = asyncio.Lock()
+		self._lifecycle_lock: asyncio.Lock = asyncio.Lock()
 		self._idle_task: Optional[asyncio.Task] = None
 		self._page_to_id: dict[Page, str] = {}
 		self._id_to_page: dict[str, Page] = {}
 		self._next_tab_seq: int = 1
+
+	@property
+	def _active_page(self) -> Optional[Page]:
+		return self._active_pages.get("default")
+
+	@_active_page.setter
+	def _active_page(self, page: Optional[Page]) -> None:
+		if page is None:
+			self._active_pages.pop("default", None)
+		else:
+			self._active_pages["default"] = page
+
+	def register_client_session(self, client_key: str, session_obj: Any) -> None:
+		if client_key == "default" or client_key in self._client_finalizers:
+			return
+		try:
+			def _cleanup(_key=client_key):
+				self._active_pages.pop(_key, None)
+				self._client_finalizers.pop(_key, None)
+
+			self._client_finalizers[client_key] = weakref.finalize(session_obj, _cleanup)
+		except TypeError:
+			pass
+
+	def clear_client(self, client_key: str) -> None:
+		self._active_pages.pop(client_key, None)
+		fin = self._client_finalizers.pop(client_key, None)
+		if fin is not None:
+			fin.detach()
+
+	def get_active_page_for(self, client_key: str = "default") -> Optional[Page]:
+		page = self._active_pages.get(client_key)
+		if page is None:
+			return None
+		try:
+			if page.is_closed():
+				self._active_pages.pop(client_key, None)
+				return None
+		except Exception:
+			self._active_pages.pop(client_key, None)
+			return None
+		return page
+
+	def sibling_active_tabs(self, client_key: str = "default") -> list[tuple[str, str, Page, bool]]:
+		self._prune_closed_tabs()
+		seen: dict[tuple[str, Page], bool] = {}
+		for other_key, page in list(self._active_pages.items()):
+			if other_key == client_key or page is None:
+				continue
+			try:
+				if page.is_closed():
+					self._active_pages.pop(other_key, None)
+					continue
+			except Exception:
+				self._active_pages.pop(other_key, None)
+				continue
+			ka_active = "keep_alive_mgr" in globals() and keep_alive_mgr.is_active(page)
+			seen[(other_key, page)] = ka_active
+		if "keep_alive_mgr" in globals():
+			for page, owner in keep_alive_mgr.active_pages_with_owners():
+				if owner == client_key:
+					continue
+				seen[(owner, page)] = True
+		results: list[tuple[str, str, Page, bool]] = []
+		for (other_key, page), ka_active in seen.items():
+			results.append((other_key, self.get_tab_id(page), page, ka_active))
+		return results
 
 	def _touch_activity(self):
 		if self._idle_task is not None and not self._idle_task.done():
@@ -931,11 +1043,9 @@ class BrowserSessionManager:
 	async def _idle_watchdog(self):
 		try:
 			await asyncio.sleep(IDLE_TIMEOUT_SECONDS)
-			# Do not auto-stop if keep-alive workers are active
 			if "keep_alive_mgr" in globals() and keep_alive_mgr.has_active():
 				self._touch_activity()
 				return
-			# Auto-stop the driver on idle if attached via CDP or if no persistent context is open
 			if self._browser is not None or self._context is None:
 				await self.close()
 		except asyncio.CancelledError:
@@ -943,35 +1053,36 @@ class BrowserSessionManager:
 
 	async def close(self):
 		"""Cleanly stop the patchright node driver and release browser handles."""
-		if "keep_alive_mgr" in globals():
-			try:
-				await asyncio.wait_for(keep_alive_mgr.stop_all(), timeout=CDP_OP_TIMEOUT_S)
-			except Exception:
-				pass
-		if "network_blocker" in globals():
-			try:
-				await asyncio.wait_for(network_blocker.close_all(), timeout=CDP_OP_TIMEOUT_S)
-			except Exception:
-				pass
-		if (
-			self._idle_task is not None
-			and not self._idle_task.done()
-			and asyncio.current_task() is not self._idle_task
-		):
-			self._idle_task.cancel()
-		self._idle_task = None
-		self._context = None
-		self._browser = None
-		self._active_page = None
-		self._page_to_id.clear()
-		self._id_to_page.clear()
-		if self._playwright is not None:
-			try:
-				await asyncio.wait_for(self._playwright.stop(), timeout=PLAYWRIGHT_STOP_TIMEOUT_S)
-			except Exception:
-				pass
-			finally:
-				self.close_sync()
+		async with self._connect_lock:
+			if "keep_alive_mgr" in globals():
+				try:
+					await asyncio.wait_for(keep_alive_mgr.stop_all(), timeout=CDP_OP_TIMEOUT_S)
+				except Exception:
+					pass
+			if "network_blocker" in globals():
+				try:
+					await asyncio.wait_for(network_blocker.close_all(), timeout=CDP_OP_TIMEOUT_S)
+				except Exception:
+					pass
+			if (
+				self._idle_task is not None
+				and not self._idle_task.done()
+				and asyncio.current_task() is not self._idle_task
+			):
+				self._idle_task.cancel()
+			self._idle_task = None
+			self._context = None
+			self._browser = None
+			self._active_pages.clear()
+			self._page_to_id.clear()
+			self._id_to_page.clear()
+			if self._playwright is not None:
+				try:
+					await asyncio.wait_for(self._playwright.stop(), timeout=PLAYWRIGHT_STOP_TIMEOUT_S)
+				except Exception:
+					pass
+				finally:
+					self.close_sync()
 
 	def close_sync(self):
 		"""Synchronously terminate the patchright node driver subprocess if still alive."""
@@ -1130,46 +1241,47 @@ class BrowserSessionManager:
 
 	async def get_context(self) -> BrowserContext:
 		self._touch_activity()
-		if self._playwright is None:
-			self._playwright = await asyncio.wait_for(
-				async_playwright().start(),
-				timeout=PLAYWRIGHT_START_TIMEOUT_S,
-			)
+		async with self._connect_lock:
+			if self._playwright is None:
+				self._playwright = await asyncio.wait_for(
+					async_playwright().start(),
+					timeout=PLAYWRIGHT_START_TIMEOUT_S,
+				)
 
-		if self._context is not None:
-			try:
-				if self._browser is not None and not self._browser.is_connected():
+			if self._context is not None:
+				try:
+					if self._browser is not None and not self._browser.is_connected():
+						self._browser = None
+						self._context = None
+					elif hasattr(self._context, "is_closed") and self._context.is_closed():
+						self._context = None
+					else:
+						_ = self._context.pages
+						return self._context
+				except Exception:
+					self._context = None
 					self._browser = None
-					self._context = None
-				elif hasattr(self._context, "is_closed") and self._context.is_closed():
-					self._context = None
-				else:
-					_ = self._context.pages
-					return self._context
-			except Exception:
-				self._context = None
-				self._browser = None
 
-		ctx = await self._connect_cdp()
-		if ctx is not None:
-			return ctx
+			ctx = await self._connect_cdp()
+			if ctx is not None:
+				return ctx
 
-		os.makedirs(CACHE_DIR, exist_ok=True)
-		lock_path = os.path.join(CACHE_DIR, f"launch-{CDP_PORT}.lock")
-		with open(lock_path, "w", encoding="utf-8") as lock_file:
-			await asyncio.to_thread(_acquire_file_lock, lock_file, 15.0)
-			try:
-				ctx = await self._connect_cdp()
-				if ctx is not None:
-					return ctx
-				await self._launch_detached_chromium()
-				ctx = await self._connect_cdp()
-				if ctx is not None:
-					return ctx
-			finally:
-				fcntl.flock(lock_file, fcntl.LOCK_UN)
+			os.makedirs(CACHE_DIR, exist_ok=True)
+			lock_path = os.path.join(CACHE_DIR, f"launch-{CDP_PORT}.lock")
+			with open(lock_path, "w", encoding="utf-8") as lock_file:
+				await asyncio.to_thread(_acquire_file_lock, lock_file, 15.0)
+				try:
+					ctx = await self._connect_cdp()
+					if ctx is not None:
+						return ctx
+					await self._launch_detached_chromium()
+					ctx = await self._connect_cdp()
+					if ctx is not None:
+						return ctx
+				finally:
+					fcntl.flock(lock_file, fcntl.LOCK_UN)
 
-		raise RuntimeError(f"Failed to connect to Chromium CDP endpoint at {self.cdp_url}")
+			raise RuntimeError(f"Failed to connect to Chromium CDP endpoint at {self.cdp_url}")
 
 	async def _configure_native_downloads(self, context: BrowserContext, page: Optional[Page] = None):
 		"""Override Playwright's allowAndName download interception with native Chromium downloads."""
@@ -1239,8 +1351,9 @@ class BrowserSessionManager:
 			setattr(page, "_dialog_history", dialogs)
 
 		def _on_closed_or_crashed(_=None):
-			if self._active_page is page:
-				self._active_page = None
+			for k, p in list(self._active_pages.items()):
+				if p is page:
+					self._active_pages.pop(k, None)
 
 		async def _on_dialog(dialog):
 			dialog_type = str(getattr(dialog, "type", "unknown") or "unknown").lower()
@@ -1273,6 +1386,9 @@ class BrowserSessionManager:
 		tab_id = self._page_to_id.pop(page, None)
 		if tab_id is not None and self._id_to_page.get(tab_id) is page:
 			self._id_to_page.pop(tab_id, None)
+		for k, p in list(self._active_pages.items()):
+			if p is page:
+				self._active_pages.pop(k, None)
 
 	def _prune_closed_tabs(self) -> None:
 		for page in list(self._page_to_id):
@@ -1282,6 +1398,16 @@ class BrowserSessionManager:
 				closed = True
 			if closed:
 				self._unregister_page(page)
+		for k, page in list(self._active_pages.items()):
+			if page is None:
+				self._active_pages.pop(k, None)
+				continue
+			try:
+				closed = page.is_closed()
+			except Exception:
+				closed = True
+			if closed:
+				self._active_pages.pop(k, None)
 
 	def get_tab_id(self, page: Page) -> str:
 		existing = self._page_to_id.get(page)
@@ -1296,9 +1422,12 @@ class BrowserSessionManager:
 			page.on("close", lambda _=None, p=page: self._unregister_page(p))
 		return tab_id
 
-	def set_active_page(self, page: Page):
-		self._active_page = page
-		if page is not None and not page.is_closed():
+	def set_active_page(self, page: Optional[Page], client_key: str = "default"):
+		if page is None:
+			self._active_pages.pop(client_key, None)
+			return
+		self._active_pages[client_key] = page
+		if not page.is_closed():
 			self._register_page_listeners(page)
 			self.get_tab_id(page)
 
@@ -1317,14 +1446,14 @@ class BrowserSessionManager:
 				continue
 		return open_pages
 
-	async def get_active_page(self) -> Page:
+	async def get_active_page(self, client_key: str = "default") -> Page:
 		self._touch_activity()
+		active = self.get_active_page_for(client_key)
 		if (
-			self._active_page is not None
-			and not self._active_page.is_closed()
+			active is not None
 			and (self._browser is None or self._browser.is_connected())
 		):
-			return self._active_page
+			return active
 
 		try:
 			context = await asyncio.wait_for(self.get_context(), timeout=GET_CONTEXT_TIMEOUT_S)
@@ -1338,7 +1467,7 @@ class BrowserSessionManager:
 				page = await asyncio.wait_for(context.new_page(), timeout=NEW_PAGE_TIMEOUT_S)
 
 			await _apply_animations_to_page(page)
-			self.set_active_page(page)
+			self.set_active_page(page, client_key=client_key)
 			return page
 		except Exception as exc:
 			if "closed" in str(exc).lower():
@@ -1353,11 +1482,11 @@ class BrowserSessionManager:
 				else:
 					page = await asyncio.wait_for(context.new_page(), timeout=NEW_PAGE_TIMEOUT_S)
 				await _apply_animations_to_page(page)
-				self.set_active_page(page)
+				self.set_active_page(page, client_key=client_key)
 				return page
 			raise
 
-	async def resolve_page(self, tab: Union[int, str] = -1) -> Page:
+	async def resolve_page(self, tab: Union[int, str] = -1, client_key: str = "default") -> Page:
 		self._touch_activity()
 		if isinstance(tab, str):
 			tab_str = tab.strip()
@@ -1390,15 +1519,15 @@ class BrowserSessionManager:
 				raise ValueError(f"Invalid tab identifier '{tab}'. Expected an integer index or tab ID like 't1'.") from exc
 
 		if tab < 0:
+			active = self.get_active_page_for(client_key)
 			if (
-				self._active_page is not None
-				and not self._active_page.is_closed()
+				active is not None
 				and (self._browser is None or self._browser.is_connected())
 			):
-				_attach_page_trackers(self._active_page)
-				self.get_tab_id(self._active_page)
-				return self._active_page
-			return await self.get_active_page()
+				_attach_page_trackers(active)
+				self.get_tab_id(active)
+				return active
+			return await self.get_active_page(client_key=client_key)
 
 		pages = await self.get_pages()
 		if tab >= len(pages):
@@ -1468,6 +1597,7 @@ class KeepAliveManager:
 	def __init__(self):
 		self._tasks: dict[Page, asyncio.Task] = {}
 		self._configs: dict[Page, dict] = {}
+		self._owners: dict[Page, str] = {}
 
 	def has_active(self) -> bool:
 		self._cleanup_dead_tasks()
@@ -1478,6 +1608,11 @@ class KeepAliveManager:
 		for p in dead:
 			self._tasks.pop(p, None)
 			self._configs.pop(p, None)
+			self._owners.pop(p, None)
+
+	def active_pages_with_owners(self) -> list[tuple[Page, str]]:
+		self._cleanup_dead_tasks()
+		return [(p, self._owners.get(p, "default")) for p in list(self._tasks)]
 
 	def is_active(self, page: Page) -> bool:
 		task = self._tasks.get(page)
@@ -1489,6 +1624,7 @@ class KeepAliveManager:
 	async def stop(self, page: Page):
 		task = self._tasks.pop(page, None)
 		self._configs.pop(page, None)
+		self._owners.pop(page, None)
 		if task is not None and not task.done():
 			task.cancel()
 			try:
@@ -1500,6 +1636,7 @@ class KeepAliveManager:
 		tasks = list(self._tasks.values())
 		self._tasks.clear()
 		self._configs.clear()
+		self._owners.clear()
 		for t in tasks:
 			if not t.done():
 				t.cancel()
@@ -1513,8 +1650,10 @@ class KeepAliveManager:
 		max_seconds: int = 90,
 		ping_url: Optional[str] = None,
 		click_selector: Optional[str] = None,
+		owner: str = "default",
 	):
 		await self.stop(page)
+		self._owners[page] = owner
 		self._configs[page] = {
 			"min_seconds": min_seconds,
 			"max_seconds": max_seconds,
@@ -1593,11 +1732,12 @@ async def set_page_media_state(page: Page, block_media: bool):
 
 @mcp.tool()
 @_with_tool_deadline
-async def status() -> str:
+async def status(ctx: Optional[Context] = None) -> str:
 	"""Check connection status to Stealth Browser and list all open tabs."""
 	try:
+		client_key = _session_key(ctx)
 		pages = await asyncio.wait_for(session.get_pages(), timeout=CDP_OP_TIMEOUT_S)
-		active_page = session._active_page if (session._active_page is not None and not session._active_page.is_closed()) else None
+		active_page = session.get_active_page_for(client_key)
 		mode_str = "Headless" if session.headless else "Headed"
 		lines = [f"Connected to browser session at {CDP_URL} (Mode: {mode_str})"]
 		lines.append(f"Total open tabs: {len(pages)}")
@@ -1645,10 +1785,12 @@ async def keep_alive(
 	max_seconds: int = 90,
 	ping_url: Optional[str] = None,
 	click_selector: Optional[str] = None,
+	ctx: Optional[Context] = None,
 ) -> str:
 	"""Keep a tab session alive: trusted CDP mouse/wheel input, modal auto-click, optional click_selector and heartbeat ping_url."""
 	try:
-		page = await session.resolve_page(tab)
+		client_key = _session_key(ctx)
+		page = await _resolve_page(tab, ctx)
 		pages = await asyncio.wait_for(session.get_pages(), timeout=CDP_OP_TIMEOUT_S)
 		target_index = pages.index(page) if page in pages else tab
 
@@ -1662,6 +1804,7 @@ async def keep_alive(
 			max_seconds=max_seconds,
 			ping_url=ping_url,
 			click_selector=click_selector,
+			owner=client_key,
 		)
 		ping_info = f", pinging '{ping_url}'" if ping_url else ""
 		click_info = f", real-clicking '{click_selector}'" if click_selector else ""
@@ -1699,17 +1842,19 @@ async def navigate(
 	tab: Union[int, str] = -1,
 	timeout_ms: int = 30000,
 	wait_until: str = "domcontentloaded",
+	ctx: Optional[Context] = None,
 ) -> str:
 	"""Navigate a tab to url. block_media=True blocks images/fonts/video (None preserves state); wait_until: 'domcontentloaded'|'commit'|'load'|'networkidle'. Clamped to 60s tool cap."""
 	t0 = time.perf_counter()
 	try:
+		client_key = _session_key(ctx)
 		context = await asyncio.wait_for(session.get_context(), timeout=GET_CONTEXT_TIMEOUT_S)
 		if new_tab:
 			page = await asyncio.wait_for(context.new_page(), timeout=NEW_PAGE_TIMEOUT_S)
 			await _apply_animations_to_page(page)
-			session.set_active_page(page)
+			session.set_active_page(page, client_key=client_key)
 		else:
-			page = await session.resolve_page(tab)
+			page = await _resolve_page(tab, ctx)
 
 		if block_media is not None:
 			await set_page_media_state(page, block_media=block_media)
@@ -1770,12 +1915,17 @@ async def navigate(
 
 @mcp.tool()
 @_with_tool_deadline
-async def new_tab(url: str = "about:blank", block_media: Optional[bool] = None) -> str:
+async def new_tab(
+	url: str = "about:blank",
+	block_media: Optional[bool] = None,
+	ctx: Optional[Context] = None,
+) -> str:
 	"""Open a new browser tab and navigate to url (default 'about:blank'). Set block_media=True for high-speed text-only browsing."""
-	result = await navigate(url=url, block_media=block_media, new_tab=True)
+	client_key = _session_key(ctx)
+	result = await navigate(url=url, block_media=block_media, new_tab=True, ctx=ctx)
 	if result.startswith("Navigation error:"):
 		return result
-	page = session._active_page
+	page = session.get_active_page_for(client_key)
 	if page is None or page.is_closed():
 		page = None
 		match = re.match(r"Navigated tab \[(\d+)\]", result)
@@ -1827,50 +1977,57 @@ async def wait_for_human(
 	poll_interval_s: float = 1.5,
 	notify: bool = True,
 	tab: Union[int, str] = -1,
+	ctx: Optional[Context] = None,
 ) -> str:
 	"""Hand off a tab to the human for login/2FA/CAPTCHA (switches to headed mode if needed, sends optional macOS notification) and poll until url_contains, url_not_contains, selector visible, or URL change."""
 	t0 = time.monotonic()
 	notify_proc: Optional[subprocess.Popen] = None
 	try:
-		page = await session.resolve_page(tab)
+		client_key = _session_key(ctx)
+		page = await _resolve_page(tab, ctx)
 		initial_url = page.url or ""
 		tab_id = session.get_tab_id(page)
 		switched_to_headed = False
 
-		try:
-			detected_headless = await asyncio.wait_for(
-				asyncio.to_thread(session._detect_cdp_headless),
-				timeout=CDP_OP_TIMEOUT_S,
-			)
-			if detected_headless is not None:
-				session.headless = detected_headless
-		except Exception:
-			pass
+		async with session._lifecycle_lock:
+			try:
+				detected_headless = await asyncio.wait_for(
+					asyncio.to_thread(session._detect_cdp_headless),
+					timeout=CDP_OP_TIMEOUT_S,
+				)
+				if detected_headless is not None:
+					session.headless = detected_headless
+			except Exception:
+				pass
 
-		if session.headless:
-			restart_res = await restart_browser(headless=False)
-			if isinstance(restart_res, str) and restart_res.startswith("Error"):
-				return f"Error switching to headed mode for human handoff: {restart_res}"
-			switched_to_headed = True
-			pages = await asyncio.wait_for(session.get_pages(), timeout=CDP_OP_TIMEOUT_S)
-			resolved_page = None
-			if initial_url and initial_url != "about:blank" and not initial_url.startswith("chrome://"):
-				for candidate in pages:
-					if candidate.url == initial_url:
-						resolved_page = candidate
-						break
-				if resolved_page is None:
-					origin = _url_origin(initial_url)
-					if origin:
-						for candidate in pages:
-							if (candidate.url or "").startswith(origin):
-								resolved_page = candidate
-								break
-			page = resolved_page if resolved_page is not None else await session.get_active_page()
-			session.set_active_page(page)
-			tab_id = session.get_tab_id(page)
-		else:
-			session.set_active_page(page)
+			if session.headless:
+				token = _in_lifecycle_op.set(True)
+				try:
+					restart_res = await restart_browser(headless=False)
+				finally:
+					_in_lifecycle_op.reset(token)
+				if isinstance(restart_res, str) and restart_res.startswith("Error"):
+					return f"Error switching to headed mode for human handoff: {restart_res}"
+				switched_to_headed = True
+				pages = await asyncio.wait_for(session.get_pages(), timeout=CDP_OP_TIMEOUT_S)
+				resolved_page = None
+				if initial_url and initial_url != "about:blank" and not initial_url.startswith("chrome://"):
+					for candidate in pages:
+						if candidate.url == initial_url:
+							resolved_page = candidate
+							break
+					if resolved_page is None:
+						origin = _url_origin(initial_url)
+						if origin:
+							for candidate in pages:
+								if (candidate.url or "").startswith(origin):
+									resolved_page = candidate
+									break
+				page = resolved_page if resolved_page is not None else await session.get_active_page(client_key=client_key)
+				session.set_active_page(page, client_key=client_key)
+				tab_id = session.get_tab_id(page)
+			else:
+				session.set_active_page(page, client_key=client_key)
 
 		try:
 			await page.bring_to_front()
@@ -1943,10 +2100,10 @@ async def wait_for_human(
 
 @mcp.tool()
 @_with_tool_deadline
-async def set_media(enable_media: bool = True, tab: Union[int, str] = -1) -> str:
+async def set_media(enable_media: bool = True, tab: Union[int, str] = -1, ctx: Optional[Context] = None) -> str:
 	"""Toggle media loading (images, videos, web fonts) on a tab. enable_media=False blocks heavy media for fast text-only browsing."""
 	try:
-		page = await session.resolve_page(tab)
+		page = await _resolve_page(tab, ctx)
 		await set_page_media_state(page, block_media=not enable_media)
 		pages = await asyncio.wait_for(session.get_pages(), timeout=CDP_OP_TIMEOUT_S)
 		target_idx = pages.index(page) if page in pages else -1
@@ -1958,10 +2115,15 @@ async def set_media(enable_media: bool = True, tab: Union[int, str] = -1) -> str
 
 @mcp.tool()
 @_with_tool_deadline
-async def set_animations(enabled: bool = False, persist: bool = True, tab: Union[int, str] = -1) -> str:
+async def set_animations(
+	enabled: bool = False,
+	persist: bool = True,
+	tab: Union[int, str] = -1,
+	ctx: Optional[Context] = None,
+) -> str:
 	"""Freeze CSS animations/transitions via reduced-motion emulation + a kill-stylesheet; sites may serve reduced-motion content variants, and re-enabling fully applies only after restart_browser() because init scripts cannot be removed."""
 	try:
-		page = await session.resolve_page(tab)
+		page = await _resolve_page(tab, ctx)
 		session.animations = bool(enabled)
 		if persist:
 			_save_persisted_animations(bool(enabled))
@@ -2780,11 +2942,12 @@ async def snapshot(
 	filter: str = "",
 	viewport_only: bool = False,
 	max_length: int = _DEFAULT_OUTPUT_MAX_CHARS,
+	ctx: Optional[Context] = None,
 ) -> str:
 	"""List visible interactive elements with refs (e0, e1, ...) across DOM, Shadow DOM, and same-origin iframes. Use filter/viewport_only to narrow; include_hrefs=True to show link URLs."""
 	t0 = time.perf_counter()
 	try:
-		page = await session.resolve_page(tab)
+		page = await _resolve_page(tab, ctx)
 		try:
 			raw = await asyncio.wait_for(
 				page.evaluate(
@@ -2850,11 +3013,15 @@ async def snapshot(
 
 @mcp.tool()
 @_with_tool_deadline
-async def batch(actions: list[dict], tab: Union[int, str] = -1) -> str:
+async def batch(
+	actions: list[dict],
+	tab: Union[int, str] = -1,
+	ctx: Optional[Context] = None,
+) -> str:
 	"""Run sequential actions in one turn. Valid actions: click, fill, type, select, press, wait_for, sleep, evaluate (fields: selector, ref, text, value, key, state, ms, force, expression, main_world, timeout_ms)."""
 	t0 = time.perf_counter()
 	try:
-		page = await session.resolve_page(tab)
+		page = await _resolve_page(tab, ctx)
 		before_url = getattr(page, "url", "") or ""
 		before_dialogs = len(getattr(page, "_dialog_history", None) or ())
 		results = []
@@ -3074,13 +3241,14 @@ async def get_content(
 	tab: Union[int, str] = -1,
 	offset: int = 0,
 	filter: str = "",
+	ctx: Optional[Context] = None,
 ) -> str:
 	"""Extract visible text from a tab. Supports offset (negative for tail, e.g. -3000), filter (regex/substring with context), clean=True (strips nav/hidden/whitespace), or interactive_only=True (calls snapshot)."""
 	try:
 		if interactive_only:
-			return await snapshot(selector=selector, tab=tab, filter=filter)
+			return await snapshot(selector=selector, tab=tab, filter=filter, ctx=ctx)
 
-		page = await session.resolve_page(tab)
+		page = await _resolve_page(tab, ctx)
 		if clean:
 			raw_text = await asyncio.wait_for(page.evaluate(_GET_CONTENT_CLEAN_JS, {"sel": selector}), timeout=10.0)
 			if raw_text is None:
@@ -3176,6 +3344,7 @@ async def extract(
 	include_iframes: bool = True,
 	tab: Union[int, str] = -1,
 	max_length: int = _DEFAULT_OUTPUT_MAX_CHARS,
+	ctx: Optional[Context] = None,
 ) -> str:
 	"""Extract structured JSON rows from repeated containers (cards, tables) across DOM/Shadow/iframes. fields maps name -> 'text:.sel' | '@attr .sel' | 'html:.sel' | {selector, mode, attr} (max 12 fields, limit<=200)."""
 	t0 = time.perf_counter()
@@ -3191,7 +3360,7 @@ async def extract(
 		container_selector = (container_selector or "").strip()
 		if not container_selector:
 			return "Error extracting rows: 'container_selector' must be non-empty."
-		page = await session.resolve_page(tab)
+		page = await _resolve_page(tab, ctx)
 		result = await asyncio.wait_for(
 			page.evaluate(
 				_EXTRACT_JS,
@@ -3230,6 +3399,7 @@ async def click(
 	force: bool = False,
 	tab: Union[int, str] = -1,
 	timeout_ms: int = 5000,
+	ctx: Optional[Context] = None,
 ) -> str:
 	"""Click an element by CSS selector, snapshot ref ('e12' or '@e12'), or visible text. Set force=True to bypass pointer-interception overlays."""
 	sel_clean = (selector or "").strip()
@@ -3238,7 +3408,7 @@ async def click(
 		return "Error clicking element: provide at least one of 'selector', 'ref', or 'text'"
 	label = f"ref '{ref_clean}'" if ref_clean else (f"'{sel_clean}'" if sel_clean else f"text '{text}'")
 	try:
-		page = await session.resolve_page(tab)
+		page = await _resolve_page(tab, ctx)
 		before_url = getattr(page, "url", "") or ""
 		before_dialogs = len(getattr(page, "_dialog_history", None) or ())
 		locator, label, ref_id, matched = await _resolve_locator(page, selector=sel_clean, ref=ref_clean, text=text)
@@ -3280,6 +3450,7 @@ async def type(
 	tab: Union[int, str] = -1,
 	timeout_ms: int = 5000,
 	ref: str = "",
+	ctx: Optional[Context] = None,
 ) -> str:
 	"""Type text into an input/textarea by CSS selector or snapshot ref ('e3' or '@e3')."""
 	sel_clean = (selector or "").strip()
@@ -3288,7 +3459,7 @@ async def type(
 		return "Error typing: provide either 'selector' or 'ref'"
 	label = f"ref '{ref_clean}'" if ref_clean else f"'{sel_clean}'"
 	try:
-		page = await session.resolve_page(tab)
+		page = await _resolve_page(tab, ctx)
 		before_url = getattr(page, "url", "") or ""
 		before_dialogs = len(getattr(page, "_dialog_history", None) or ())
 		locator, label, ref_id, matched = await _resolve_locator(page, selector=sel_clean, ref=ref_clean)
@@ -3320,10 +3491,10 @@ async def type(
 
 @mcp.tool()
 @_with_tool_deadline
-async def press_key(key: str, tab: Union[int, str] = -1) -> str:
+async def press_key(key: str, tab: Union[int, str] = -1, ctx: Optional[Context] = None) -> str:
 	"""Press a keyboard key (e.g., 'Enter', 'Tab', 'Escape')."""
 	try:
-		page = await session.resolve_page(tab)
+		page = await _resolve_page(tab, ctx)
 		before_url = getattr(page, "url", "") or ""
 		before_dialogs = len(getattr(page, "_dialog_history", None) or ())
 		await page.keyboard.press(key)
@@ -3335,10 +3506,15 @@ async def press_key(key: str, tab: Union[int, str] = -1) -> str:
 
 @mcp.tool()
 @_with_tool_deadline
-async def scroll(direction: str = "down", amount: int = 600, tab: Union[int, str] = -1) -> str:
+async def scroll(
+	direction: str = "down",
+	amount: int = 600,
+	tab: Union[int, str] = -1,
+	ctx: Optional[Context] = None,
+) -> str:
 	"""Scroll up or down by amount pixels."""
 	try:
-		page = await session.resolve_page(tab)
+		page = await _resolve_page(tab, ctx)
 		delta = amount if direction.lower() == "down" else -amount
 		await page.mouse.wheel(0, delta)
 		return f"Scrolled {direction} by {amount}px"
@@ -3355,10 +3531,11 @@ async def screenshot(
 	selector: str = "",
 	ref: str = "",
 	annotate: bool = False,
+	ctx: Optional[Context] = None,
 ) -> str:
 	"""Capture a screenshot of the active page, full page, or a specific element (by selector or snapshot ref). Set annotate=True to temporarily overlay snapshot ref labels (e0, e1, ...)."""
 	try:
-		page = await session.resolve_page(tab)
+		page = await _resolve_page(tab, ctx)
 		if not save_path:
 			timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 			save_path = f"/tmp/screenshot_{timestamp}.png"
@@ -3411,11 +3588,12 @@ async def fetch(
 	timeout_ms: int = 15000,
 	save_path: str = "",
 	max_length: int = _DEFAULT_OUTPUT_MAX_CHARS,
+	ctx: Optional[Context] = None,
 ) -> str:
 	"""Execute an authenticated in-browser fetch (supports relative, absolute, and blob: URLs). Pass save_path to write binary/PDF responses to disk without entering context."""
 	t0 = time.perf_counter()
 	try:
-		page = await session.resolve_page(tab)
+		page = await _resolve_page(tab, ctx)
 
 		if isinstance(body, (dict, list)):
 			body = json.dumps(body)
@@ -4139,10 +4317,11 @@ async def network_requests(
 	clear: bool = False,
 	tab: Union[int, str] = -1,
 	max_length: int = _DEFAULT_OUTPUT_MAX_CHARS,
+	ctx: Optional[Context] = None,
 ) -> str:
 	"""List captured network responses/failures for a tab. Filter by url_filter, resource_type ('xhr,fetch'), content_type ('json','pdf'), or status_min (e.g. 400)."""
 	try:
-		page = await session.resolve_page(tab)
+		page = await _resolve_page(tab, ctx)
 		_attach_page_trackers(page)
 		entries, total = telemetry_tracker.get_network(
 			page=page,
@@ -4191,10 +4370,11 @@ async def console_logs(
 	clear: bool = False,
 	tab: Union[int, str] = -1,
 	max_length: int = _DEFAULT_OUTPUT_MAX_CHARS,
+	ctx: Optional[Context] = None,
 ) -> str:
 	"""List captured browser console messages and page errors (filter by comma-separated level: 'error,warning,log,pageerror'). Attaches CDP console listener on first call."""
 	try:
-		page = await session.resolve_page(tab)
+		page = await _resolve_page(tab, ctx)
 		_attach_page_trackers(page)
 		await telemetry_tracker.ensure_console_capture(page)
 		entries, total = telemetry_tracker.get_console(
@@ -4229,11 +4409,12 @@ async def state(
 	selector: str = "",
 	tab: Union[int, str] = -1,
 	max_length: int = _DEFAULT_OUTPUT_MAX_CHARS,
+	ctx: Optional[Context] = None,
 ) -> str:
 	"""Inspect in-memory client-side state (framework: 'auto'|'next'|'redux'|'react'|'vue'|'apollo'|'query'; optional selector for React Fiber)."""
 	t0 = time.perf_counter()
 	try:
-		page = await session.resolve_page(tab)
+		page = await _resolve_page(tab, ctx)
 		js_script = """({ targetFramework, selector }) => {
 			function safeSerialize(obj, maxDepth = 4, maxKeys = 80) {
 				const seen = new WeakSet();
@@ -4456,13 +4637,14 @@ async def evaluate_js(
 	script: str = "",
 	max_length: int = _DEFAULT_OUTPUT_MAX_CHARS,
 	main_world: bool = False,
+	ctx: Optional[Context] = None,
 ) -> str:
 	"""Evaluate JS in isolated world by default (alias: script=). Set main_world=True for page globals."""
 	code = expression if expression and expression.strip() else script
 	if not code or not code.strip():
 		return "JavaScript execution error: 'expression' (or alias 'script') must be non-empty."
 	try:
-		page = await session.resolve_page(tab)
+		page = await _resolve_page(tab, ctx)
 		result = await asyncio.wait_for(
 			page.evaluate(code, isolated_context=not main_world),
 			timeout=timeout_ms / 1000.0,
@@ -4488,6 +4670,7 @@ async def wait_for(
 	state: str = "visible",
 	timeout_ms: int = 15000,
 	tab: Union[int, str] = -1,
+	ctx: Optional[Context] = None,
 ) -> str:
 	"""Wait for a CSS selector state, visible page text substring, URL substring, or combination. Clamped to 60s cap."""
 	if not selector and not text and not url_contains:
@@ -4505,7 +4688,7 @@ async def wait_for(
 	page: Optional[Page] = None
 
 	try:
-		page = await session.resolve_page(tab)
+		page = await _resolve_page(tab, ctx)
 		matched: list[str] = []
 
 		if url_contains:
@@ -4602,14 +4785,39 @@ async def wait_for(
 		return f"Error in wait_for: {_format_playwright_error(exc)}"
 
 
+def _check_sibling_sessions(action_desc: str, client_key: str, force: bool, force_hint: str) -> Optional[str]:
+	if force or _in_lifecycle_op.get():
+		return None
+	siblings = session.sibling_active_tabs(client_key)
+	if not siblings:
+		return None
+	lines = []
+	for other_key, tab_id, page, ka_active in siblings:
+		ka_tag = " [KEEP-ALIVE ACTIVE]" if ka_active else ""
+		url = getattr(page, "url", "") or ""
+		lines.append(f"\t[{tab_id}] ({other_key}) {url}{ka_tag}")
+	tab_list = "\n".join(lines)
+	return (
+		f"Refusing to {action_desc} because {len(siblings)} sibling session(s) have active tab(s) "
+		f"(this would disrupt other connected clients):\n"
+		f"{tab_list}\n"
+		f"Ask before interrupting sibling sessions, or call {force_hint} to proceed."
+	)
+
+
 @mcp.tool()
 @_with_tool_deadline
-async def switch_tab(tab: Union[int, str, None] = None, index: Optional[int] = None) -> str:
+async def switch_tab(
+	tab: Union[int, str, None] = None,
+	index: Optional[int] = None,
+	ctx: Optional[Context] = None,
+) -> str:
 	"""Switch focus to an open tab by numeric index or stable tab id like 't2' (see status). Accepts 'tab' or legacy alias 'index'."""
 	target = tab if tab is not None else index
 	if target is None:
 		return "Error switching tab: provide a 'tab' (or 'index') value."
 	try:
+		client_key = _session_key(ctx)
 		pages = await asyncio.wait_for(session.get_pages(), timeout=CDP_OP_TIMEOUT_S)
 		if isinstance(target, str):
 			norm = target.strip().lower()
@@ -4621,7 +4829,7 @@ async def switch_tab(tab: Union[int, str, None] = None, index: Optional[int] = N
 			return f"Invalid tab index {target}. Total open tabs: {len(pages)}"
 
 		page = pages[target]
-		session.set_active_page(page)
+		session.set_active_page(page, client_key=client_key)
 		await asyncio.wait_for(page.bring_to_front(), timeout=CDP_OP_TIMEOUT_S)
 		try:
 			title = await asyncio.wait_for(page.title(), timeout=PAGE_TITLE_TIMEOUT_S)
@@ -4636,16 +4844,21 @@ async def switch_tab(tab: Union[int, str, None] = None, index: Optional[int] = N
 
 @mcp.tool()
 @_with_tool_deadline
-async def close_tab(tab: Union[int, str, None] = None, index: Optional[int] = None) -> str:
+async def close_tab(
+	tab: Union[int, str, None] = None,
+	index: Optional[int] = None,
+	ctx: Optional[Context] = None,
+) -> str:
 	"""Close a tab by numeric index or stable tab id like 't2' (-1 closes active tab, -99 or closing last tab terminates the browser window). Accepts 'tab' or legacy alias 'index'."""
 	target = tab if tab is not None else (index if index is not None else -1)
 	try:
+		client_key = _session_key(ctx)
 		if target == -99:
-			return await close_browser()
+			return await close_browser(ctx=ctx) if ctx is not None else await close_browser()
 
 		pages = await asyncio.wait_for(session.get_pages(), timeout=CDP_OP_TIMEOUT_S)
 		if not pages:
-			return await close_browser()
+			return await close_browser(ctx=ctx) if ctx is not None else await close_browser()
 
 		if isinstance(target, str):
 			norm = target.strip().lower()
@@ -4655,8 +4868,9 @@ async def close_tab(tab: Union[int, str, None] = None, index: Optional[int] = No
 			target = resolved
 
 		if target == -1:
-			if session._active_page is not None and not session._active_page.is_closed():
-				page = session._active_page
+			active = session.get_active_page_for(client_key)
+			if active is not None:
+				page = active
 			else:
 				page = pages[-1]
 			target_index = pages.index(page) if page in pages else -1
@@ -4668,6 +4882,7 @@ async def close_tab(tab: Union[int, str, None] = None, index: Optional[int] = No
 
 		url = page.url
 		tab_id = session.get_tab_id(page)
+		was_active = page == session.get_active_page_for(client_key)
 		try:
 			await asyncio.wait_for(keep_alive_mgr.stop(page), timeout=CDP_OP_TIMEOUT_S)
 		except Exception:
@@ -4689,10 +4904,13 @@ async def close_tab(tab: Union[int, str, None] = None, index: Optional[int] = No
 			return f"Error closing tab [{target_index}]: renderer unresponsive and CDP endpoint dead — wedged browser force-restarted; the next call relaunches it, reopen the tab and re-navigate."
 
 		remaining = await asyncio.wait_for(session.get_pages(), timeout=CDP_OP_TIMEOUT_S)
-		if page == session._active_page:
-			session._active_page = remaining[-1] if remaining else None
+		if was_active:
+			session.set_active_page(remaining[-1] if remaining else None, client_key=client_key)
 		if not remaining:
-			await close_browser()
+			if ctx is not None:
+				await close_browser(ctx=ctx)
+			else:
+				await close_browser()
 			return f"Closed last tab [{target_index}] ({tab_id}) ({url}). Browser window completely closed."
 		return f"Closed tab [{target_index}] ({tab_id}) ({url}). Remaining open tabs: {len(remaining)}"
 	except asyncio.TimeoutError:
@@ -4721,49 +4939,77 @@ def _force_kill_browser_processes():
 		pass
 
 
+async def _close_browser_inner(force_kill: bool = True) -> str:
+	cdp_timed_out = False
+	if session._browser is not None and session._browser.is_connected():
+		try:
+			cdp = await asyncio.wait_for(
+				session._browser.new_browser_cdp_session(),
+				timeout=BROWSER_CLOSE_TIMEOUT_S,
+			)
+			await asyncio.wait_for(cdp.send("Browser.close"), timeout=BROWSER_CLOSE_TIMEOUT_S)
+		except asyncio.TimeoutError:
+			cdp_timed_out = True
+		except Exception:
+			pass
+	if not cdp_timed_out and session._context is not None:
+		try:
+			await asyncio.wait_for(session._context.close(), timeout=BROWSER_CLOSE_TIMEOUT_S)
+		except Exception:
+			pass
+	if not cdp_timed_out and session._browser is not None:
+		try:
+			await asyncio.wait_for(session._browser.close(), timeout=BROWSER_CLOSE_TIMEOUT_S)
+		except Exception:
+			pass
+	try:
+		await asyncio.wait_for(session.close(), timeout=BROWSER_CLOSE_TIMEOUT_S)
+	except Exception:
+		session.close_sync()
+	_save_persisted_headless(None)
+	if force_kill:
+		try:
+			await asyncio.wait_for(asyncio.to_thread(_force_kill_browser_processes), timeout=10.0)
+		except Exception:
+			pass
+	return "Browser completely closed and all resources released."
+
+
 @mcp.tool()
 @_with_tool_deadline
-async def close_browser(force_kill: bool = True) -> str:
+async def close_browser(
+	force_kill: bool = True,
+	force: bool = False,
+	ctx: Optional[Context] = None,
+) -> str:
 	"""Completely close the browser window, terminate all browser and renderer processes, and release all resources."""
 	try:
-		cdp_timed_out = False
-		if session._browser is not None and session._browser.is_connected():
+		client_key = _session_key(ctx)
+		if _in_lifecycle_op.get():
+			return await _close_browser_inner(force_kill=force_kill)
+		async with session._lifecycle_lock:
+			refusal = _check_sibling_sessions(
+				"close the browser",
+				client_key,
+				force=force,
+				force_hint="close_browser(force=True)",
+			)
+			if refusal is not None:
+				return refusal
+			token = _in_lifecycle_op.set(True)
 			try:
-				cdp = await asyncio.wait_for(
-					session._browser.new_browser_cdp_session(),
-					timeout=BROWSER_CLOSE_TIMEOUT_S,
-				)
-				await asyncio.wait_for(cdp.send("Browser.close"), timeout=BROWSER_CLOSE_TIMEOUT_S)
-			except asyncio.TimeoutError:
-				cdp_timed_out = True
-			except Exception:
-				pass
-		if not cdp_timed_out and session._context is not None:
-			try:
-				await asyncio.wait_for(session._context.close(), timeout=BROWSER_CLOSE_TIMEOUT_S)
-			except Exception:
-				pass
-		if not cdp_timed_out and session._browser is not None:
-			try:
-				await asyncio.wait_for(session._browser.close(), timeout=BROWSER_CLOSE_TIMEOUT_S)
-			except Exception:
-				pass
-		try:
-			await asyncio.wait_for(session.close(), timeout=BROWSER_CLOSE_TIMEOUT_S)
-		except Exception:
-			session.close_sync()
-		_save_persisted_headless(None)
-		if force_kill:
-			try:
-				await asyncio.wait_for(asyncio.to_thread(_force_kill_browser_processes), timeout=10.0)
-			except Exception:
-				pass
-		return "Browser completely closed and all resources released."
+				return await _close_browser_inner(force_kill=force_kill)
+			finally:
+				_in_lifecycle_op.reset(token)
 	except Exception as exc:
 		return f"Error closing browser: {exc}"
 
 
-async def _restart_browser_inner(headless: Optional[bool] = None, url: Optional[str] = None) -> str:
+async def _restart_browser_inner(
+	headless: Optional[bool] = None,
+	url: Optional[str] = None,
+	client_key: str = "default",
+) -> str:
 	preserved_urls: list[str] = []
 	try:
 		pages = await asyncio.wait_for(session.get_pages(), timeout=CDP_OP_TIMEOUT_S)
@@ -4777,8 +5023,8 @@ async def _restart_browser_inner(headless: Optional[bool] = None, url: Optional[
 
 	if not preserved_urls:
 		try:
-			active = session._active_page
-			if active is not None and not active.is_closed():
+			active = session.get_active_page_for(client_key)
+			if active is not None:
 				curr = active.url
 				if curr and curr != "about:blank" and not curr.startswith("chrome://") and not curr.startswith("chrome-error://"):
 					preserved_urls.append(curr)
@@ -4794,7 +5040,7 @@ async def _restart_browser_inner(headless: Optional[bool] = None, url: Optional[
 	await close_browser(force_kill=True)
 	_save_persisted_headless(session.headless)
 	await asyncio.sleep(0.3)
-	page = await session.get_active_page()
+	page = await session.get_active_page(client_key=client_key)
 	if target_url:
 		try:
 			await asyncio.wait_for(
@@ -4803,13 +5049,13 @@ async def _restart_browser_inner(headless: Optional[bool] = None, url: Optional[
 			)
 		except Exception:
 			pass
-	ctx = await asyncio.wait_for(session.get_context(), timeout=GET_CONTEXT_TIMEOUT_S)
+	ctx_browser = await asyncio.wait_for(session.get_context(), timeout=GET_CONTEXT_TIMEOUT_S)
 	urls_to_reopen = [u for u in extra_urls if not (url is not None and u == url)]
 	if urls_to_reopen:
 		reopen_pairs: list[tuple[Page, str]] = []
 		for extra_url in urls_to_reopen:
 			try:
-				new_page = await asyncio.wait_for(ctx.new_page(), timeout=NEW_PAGE_TIMEOUT_S)
+				new_page = await asyncio.wait_for(ctx_browser.new_page(), timeout=NEW_PAGE_TIMEOUT_S)
 				reopen_pairs.append((new_page, extra_url))
 			except Exception:
 				pass
@@ -4838,13 +5084,37 @@ async def _restart_browser_inner(headless: Optional[bool] = None, url: Optional[
 
 @mcp.tool()
 @_with_tool_deadline
-async def restart_browser(headless: Optional[bool] = None, url: Optional[str] = None) -> str:
+async def restart_browser(
+	headless: Optional[bool] = None,
+	url: Optional[str] = None,
+	force: bool = False,
+	ctx: Optional[Context] = None,
+) -> str:
 	"""Restart Chromium cleanly, preserving non-blank tabs unless url overrides tab [0]. headless=None keeps current mode."""
 	try:
-		return await asyncio.wait_for(
-			_restart_browser_inner(headless=headless, url=url),
-			timeout=RESTART_BROWSER_TIMEOUT_S,
-		)
+		client_key = _session_key(ctx)
+		if _in_lifecycle_op.get():
+			return await asyncio.wait_for(
+				_restart_browser_inner(headless=headless, url=url, client_key=client_key),
+				timeout=RESTART_BROWSER_TIMEOUT_S,
+			)
+		async with session._lifecycle_lock:
+			refusal = _check_sibling_sessions(
+				"restart the browser",
+				client_key,
+				force=force,
+				force_hint=f"restart_browser(headless={headless}, force=True)",
+			)
+			if refusal is not None:
+				return refusal
+			token = _in_lifecycle_op.set(True)
+			try:
+				return await asyncio.wait_for(
+					_restart_browser_inner(headless=headless, url=url, client_key=client_key),
+					timeout=RESTART_BROWSER_TIMEOUT_S,
+				)
+			finally:
+				_in_lifecycle_op.reset(token)
 	except asyncio.TimeoutError:
 		return f"Error restarting browser: Timed out after {int(RESTART_BROWSER_TIMEOUT_S)}s"
 	except Exception as exc:
@@ -4853,45 +5123,64 @@ async def restart_browser(headless: Optional[bool] = None, url: Optional[str] = 
 
 @mcp.tool()
 @_with_tool_deadline
-async def set_headless(headless: bool = True, force: bool = False) -> str:
+async def set_headless(
+	headless: bool = True,
+	force: bool = False,
+	ctx: Optional[Context] = None,
+) -> str:
 	"""Switch headless (default) vs headed mode; restarts Chromium on change (switching to headless refuses if non-blank tabs exist unless force=True). Prefer wait_for_human() for login/2FA."""
-	pages: list[Page] = []
-	try:
-		pages = await asyncio.wait_for(session.get_pages(), timeout=CDP_OP_TIMEOUT_S)
-	except Exception:
-		pages = []
+	client_key = _session_key(ctx)
+	async with session._lifecycle_lock:
+		pages: list[Page] = []
+		try:
+			pages = await asyncio.wait_for(session.get_pages(), timeout=CDP_OP_TIMEOUT_S)
+		except Exception:
+			pages = []
 
-	try:
-		detected_headless = await asyncio.wait_for(
-			asyncio.to_thread(session._detect_cdp_headless),
-			timeout=CDP_OP_TIMEOUT_S,
+		try:
+			detected_headless = await asyncio.wait_for(
+				asyncio.to_thread(session._detect_cdp_headless),
+				timeout=CDP_OP_TIMEOUT_S,
+			)
+			if detected_headless is not None:
+				session.headless = detected_headless
+		except Exception:
+			pass
+
+		if session.headless == headless and (session._context is not None or session._browser is not None):
+			mode_str = "Headless" if headless else "Headed"
+			return f"Browser is already running in {mode_str} mode."
+
+		refusal = _check_sibling_sessions(
+			"restart the browser to switch mode",
+			client_key,
+			force=force,
+			force_hint=f"set_headless(headless={headless}, force=True)",
 		)
-		if detected_headless is not None:
-			session.headless = detected_headless
-	except Exception:
-		pass
+		if refusal is not None:
+			return refusal
 
-	if session.headless == headless and (session._context is not None or session._browser is not None):
-		mode_str = "Headless" if headless else "Headed"
-		return f"Browser is already running in {mode_str} mode."
+		active_tabs = [
+			(idx, p.url)
+			for idx, p in enumerate(pages)
+			if not p.is_closed() and p.url and p.url != "about:blank" and not p.url.startswith("chrome://")
+		]
+		if headless and active_tabs and not force:
+			target_mode = "Headless" if headless else "Headed"
+			tab_list = "\n".join(f"\t[{idx}] {tab_url}" for idx, tab_url in active_tabs)
+			return (
+				f"Refusing to restart browser to switch to {target_mode} mode because {len(active_tabs)} "
+				f"tab(s) are currently open (switching modes restarts Chromium and may disrupt active logins/sessions):\n"
+				f"{tab_list}\n"
+				f"Keep using the current browser mode, ask the user before interrupting, or call "
+				f"set_headless(headless={headless}, force=True) to restart and reopen these URLs."
+			)
 
-	active_tabs = [
-		(idx, p.url)
-		for idx, p in enumerate(pages)
-		if not p.is_closed() and p.url and p.url != "about:blank" and not p.url.startswith("chrome://")
-	]
-	if headless and active_tabs and not force:
-		target_mode = "Headless" if headless else "Headed"
-		tab_list = "\n".join(f"\t[{idx}] {tab_url}" for idx, tab_url in active_tabs)
-		return (
-			f"Refusing to restart browser to switch to {target_mode} mode because {len(active_tabs)} "
-			f"tab(s) are currently open (switching modes restarts Chromium and may disrupt active logins/sessions):\n"
-			f"{tab_list}\n"
-			f"Keep using the current browser mode, ask the user before interrupting, or call "
-			f"set_headless(headless={headless}, force=True) to restart and reopen these URLs."
-		)
-
-	return await restart_browser(headless=headless)
+		token = _in_lifecycle_op.set(True)
+		try:
+			return await restart_browser(headless=headless)
+		finally:
+			_in_lifecycle_op.reset(token)
 
 
 def _install_browser() -> int:
