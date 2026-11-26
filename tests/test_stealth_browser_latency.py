@@ -547,21 +547,28 @@ def test_new_tab_avoids_duplicate_get_pages_and_connect_cdp_parallelizes(monkeyp
 		mgr2._playwright = MagicMock()
 		mgr2._playwright.chromium.connect_over_cdp = AsyncMock(return_value=fake_browser)
 
+		import threading
+
+		detect_started = threading.Event()
+		interceptor_started = threading.Event()
+		overlap_seen = False
+
 		def slow_detect():
-			time.sleep(0.06)
+			nonlocal overlap_seen
+			detect_started.set()
+			overlap_seen = interceptor_started.wait(timeout=2.0)
 			return False
 
 		async def slow_interceptor(ctx):
-			await asyncio.sleep(0.06)
+			interceptor_started.set()
+			await asyncio.to_thread(detect_started.wait, 2.0)
 
 		mgr2._detect_cdp_headless = slow_detect
 		mgr2._ensure_interceptor = slow_interceptor
-		t0 = time.perf_counter()
 		ctx = await mgr2._connect_cdp()
-		elapsed = time.perf_counter() - t0
 		assert ctx is fake_ctx
 		assert mgr2.headless is False
-		assert elapsed < 0.11, f"Expected parallel _connect_cdp (<0.11s), got {elapsed:.3f}s"
+		assert overlap_seen, "Expected _detect_cdp_headless and _ensure_interceptor to run concurrently"
 
 	asyncio.run(_run())
 
