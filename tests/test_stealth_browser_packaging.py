@@ -40,6 +40,7 @@ def test_version_is_single_source():
 	version = re.search(r'^__version__ = "([^"]+)"', script, re.MULTILINE)
 	assert version, "__version__ missing"
 	assert version.group(1) == "0.1.0"
+	assert "__version__" not in PYPROJECT.read_text(encoding="utf-8"), "version must come from the script only"
 
 
 def test_cli_flags_are_exposed():

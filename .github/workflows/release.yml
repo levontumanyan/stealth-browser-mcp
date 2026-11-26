@@ -1,0 +1,67 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Read and validate version
+        id: version
+        run: |
+          version=$(uv run python -c "import re, pathlib; print(re.search(r'^__version__ = \"([^\"]+)\"', pathlib.Path('bin/stealth_browser.py').read_text(), re.M).group(1))")
+          test "v${version}" = "${GITHUB_REF_NAME}" || { echo "Tag ${GITHUB_REF_NAME} does not match __version__ ${version}"; exit 1; }
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+      - name: Run tests
+        run: |
+          uv sync --locked
+          uv run pytest tests/ -q
+      - name: Build sdist and wheel
+        run: uv build --out-dir dist
+      - name: Verify wheel contents
+        run: |
+          uv run python - <<'PY'
+          import glob, zipfile
+          wheel = glob.glob("dist/stealthmcp-*.whl")[0]
+          names = zipfile.ZipFile(wheel).namelist()
+          assert "stealth_browser.py" in names, names
+          entry = next(n for n in names if n.endswith("entry_points.txt"))
+          assert "stealth-browser = stealth_browser:main" in zipfile.ZipFile(wheel).read(entry).decode(), entry
+          print(f"Verified {wheel}")
+          PY
+      - name: Smoke-test built wheel
+        run: |
+          uv tool install --python 3.14 dist/stealthmcp-*.whl
+          stealth-browser --version
+          stealth-browser --doctor
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: macos-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/stealthmcp/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: astral-sh/setup-uv@v5
+      - name: Publish to PyPI
+        run: uv publish --trusted-publishing always dist/*
