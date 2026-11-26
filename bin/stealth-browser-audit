@@ -20,10 +20,12 @@ from pathlib import Path
 from typing import Any, Optional
 
 SCHEMA_VERSION = 1
+CACHE_SCHEMA_VERSION = 1
 
 BRAIN_DIR = Path.home() / ".gemini" / "antigravity-cli" / "brain"
 SUMMARY_DB = Path.home() / ".gemini" / "antigravity-cli" / "conversation_summaries.db"
 OPENCODE_DIR = Path.home() / ".local" / "share" / "opencode"
+CACHE_DIR = Path.home() / ".cache" / "stealth-browser-audit"
 
 KNOWN_TOOLS = (
 	"status",
@@ -689,6 +691,409 @@ def extract_nested_shell_calls(code: str) -> list[tuple[str, dict[str, Any], boo
 	return []
 
 
+def _new_sess_state() -> dict[str, Any]:
+	return {
+		"calls": 0,
+		"errors": 0,
+		"schema_reads": 0,
+		"chars": 0,
+		"input_chars": 0,
+		"schema_chars": 0,
+		"overflows": 0,
+		"shared_execute_outputs": 0,
+		"domains": set(),
+		"tools": collections.Counter(),
+		"date": "",
+		"prev_tool": None,
+		"prev_errored": False,
+		"prev_was_screenshot": False,
+		"first_call_at": None,
+		"last_call_at": None,
+		"snapshot_calls": 0,
+		"snapshot_chars": 0,
+		"snapshot_rows": 0,
+		"last_js_intent": "",
+	}
+
+
+class SessionCache:
+	def __init__(self, cache_dir: Path):
+		self.cache_dir = cache_dir
+		self.db_path = cache_dir / f"cache-v{CACHE_SCHEMA_VERSION}.sqlite"
+		self.conn: Optional[sqlite3.Connection] = None
+		try:
+			cache_dir.mkdir(parents=True, exist_ok=True)
+			conn = sqlite3.connect(str(self.db_path), timeout=5.0)
+			conn.execute("PRAGMA journal_mode=WAL")
+			conn.execute("PRAGMA synchronous=NORMAL")
+			conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+			conn.execute(
+				"CREATE TABLE IF NOT EXISTS sessions ("
+				"source TEXT NOT NULL, "
+				"session_id TEXT NOT NULL, "
+				"file_path TEXT NOT NULL, "
+				"mtime_ns INTEGER NOT NULL, "
+				"size INTEGER NOT NULL, "
+				"payload TEXT NOT NULL, "
+				"PRIMARY KEY (source, session_id))"
+			)
+			row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+			if row is None or row[0] != str(CACHE_SCHEMA_VERSION):
+				conn.execute("DELETE FROM sessions")
+				conn.execute(
+					"INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
+					(str(CACHE_SCHEMA_VERSION),),
+				)
+			conn.commit()
+			self.conn = conn
+		except (OSError, sqlite3.Error, ValueError):
+			self.conn = None
+
+	def load_source(self, source: str) -> dict[str, tuple[str, int, int, str]]:
+		if self.conn is None:
+			return {}
+		try:
+			rows = self.conn.execute(
+				"SELECT session_id, file_path, mtime_ns, size, payload FROM sessions WHERE source = ?",
+				(source,),
+			).fetchall()
+			return {sid: (fp, mtime_ns, size, payload) for sid, fp, mtime_ns, size, payload in rows}
+		except (OSError, sqlite3.Error):
+			self.close()
+			return {}
+
+	def upsert_many(self, rows: list[tuple[str, str, str, int, int, str]]) -> None:
+		if self.conn is None or not rows:
+			return
+		try:
+			with self.conn:
+				self.conn.executemany(
+					"INSERT OR REPLACE INTO sessions (source, session_id, file_path, mtime_ns, size, payload) "
+					"VALUES (?, ?, ?, ?, ?, ?)",
+					rows,
+				)
+		except (OSError, sqlite3.Error):
+			self.close()
+
+	def close(self) -> None:
+		if self.conn is not None:
+			try:
+				self.conn.close()
+			except sqlite3.Error:
+				pass
+			self.conn = None
+
+
+def _extract_call_event(
+	tool: str,
+	raw_args: dict[str, Any],
+	body: str,
+	explicit_error: bool,
+	duration_s: Optional[float],
+	nested: bool = False,
+	output_chars: Optional[int] = None,
+	classify_body: Optional[str] = None,
+	called_at: Optional[datetime.datetime] = None,
+	overflow: bool = False,
+	shared_exec: bool = False,
+) -> dict[str, Any]:
+	chars = len(body) if output_chars is None else output_chars
+	args_json = json.dumps(raw_args) if raw_args else ""
+	input_chars = len(args_json)
+	ev: dict[str, Any] = {
+		"k": "c",
+		"t": called_at.isoformat() if called_at is not None else None,
+		"tool": tool,
+		"ch": chars,
+		"ich": input_chars,
+	}
+	if args_json:
+		ev["ap"] = args_json[:140]
+	if overflow:
+		ev["ov"] = 1
+	if nested:
+		ev["ne"] = 1
+	if shared_exec:
+		ev["se"] = 1
+	if tool == "snapshot":
+		srows = len(SNAPSHOT_ROW_RE.findall(body))
+		if srows:
+			ev["sr"] = srows
+	if tool == "set_headless":
+		ev["hargs"] = raw_args
+		ev["hout"] = body[:160].replace("\n", " ")
+
+	host = extract_domain(raw_args.get("url"))
+	if host:
+		ev["dom"] = host
+	body_domains: list[str] = []
+	seen_bdom: set[str] = set()
+	for m in URL_HOST_RE.findall(body[:4000]):
+		h = m.lower()
+		if h not in ("127.0.0.1", "localhost", "errors.pydantic.dev") and h not in seen_bdom:
+			seen_bdom.add(h)
+			body_domains.append(h)
+	if body_domains:
+		ev["bdom"] = body_domains
+
+	if tool == "evaluate_js" and (not nested or raw_args):
+		expr = str(raw_args.get("expression") or raw_args.get("script") or (raw_args.get("code") if nested else "") or "")
+		intent, flags = classify_js_intent(expr)
+		ev["ji"] = intent
+		if flags:
+			ev["jf"] = flags
+		ev["je"] = expr[:200].replace("\n", " ")
+
+	cbody = unwrap_result_json(body) if classify_body is None else classify_body
+	outcome = classify_outcome(tool, cbody, explicit_error=explicit_error)
+	if outcome:
+		ev["out"] = outcome
+		ev["ep"] = cbody[:220].replace("\n", " ")
+		if outcome == "validation_error":
+			ev["vsig"] = parse_validation_signature(tool, cbody, raw_args)
+		elif outcome not in SOFT_OUTCOMES:
+			if tool == "click":
+				ev["er"] = classify_click_reason(outcome, cbody)
+				ev["sel"] = str(raw_args.get("selector", ""))[:80]
+			elif tool == "status":
+				ev["er"] = classify_status_reason(outcome, cbody)
+			elif tool == "navigate":
+				ev["er"] = classify_navigate_reason(outcome, cbody)
+	if outcome != "validation_error":
+		silent_mismatch = detect_silent_param_mismatch(tool, raw_args)
+		if silent_mismatch:
+			ev["sm"] = silent_mismatch
+
+	if duration_s is not None:
+		ev["dur"] = duration_s
+		if duration_s >= 0 and outcome != "mcp_timeout_3m":
+			body_lines = body.splitlines()
+			if body_lines:
+				tail = body_lines[-1][:140]
+				if tail:
+					ev["tail"] = tail
+	return ev
+
+
+def _extract_agy_session_payload(
+	file_dt: datetime.datetime,
+	turns: list[tuple[dict[str, Any], list[str]]],
+	raw_bytes: bytes,
+) -> dict[str, Any]:
+	events: list[dict[str, Any]] = []
+	has_calls = False
+	for step, generic_outputs in turns:
+		tcs = step.get("tool_calls") or []
+		step_dt: Optional[datetime.datetime] = None
+		for idx, tc in enumerate(tcs):
+			name = tc.get("name", "")
+			if name not in ("call_mcp_tool", "read_file", "invoke_subagent"):
+				continue
+			args = tc.get("args") or {}
+
+			if name == "read_file":
+				p = str(unquote(args.get("Path", "")))
+				is_schema = "/mcp/stealth-browser/" in p
+				pl = p.lower()
+				is_ss_path = "screenshot" in pl or pl.endswith(".png")
+				if not (is_schema or is_ss_path):
+					continue
+				out = generic_outputs[idx] if idx < len(generic_outputs) else ""
+				body, created_dt, _ = strip_agy_headers(out)
+				if step_dt is None:
+					step_dt = parse_ts(step.get("created_at")) or file_dt
+				call_dt = created_dt or step_dt
+				events.append({
+					"k": "rf",
+					"t": call_dt.isoformat(),
+					"ch": len(body) if is_schema else 0,
+					"sc": 1 if is_schema else 0,
+					"ss": 1 if is_ss_path else 0,
+				})
+				continue
+
+			if name == "invoke_subagent":
+				tn = str(unquote(args.get("TypeName", "")))
+				if "browser" not in tn.lower():
+					continue
+				out = generic_outputs[idx] if idx < len(generic_outputs) else ""
+				_, created_dt, _ = strip_agy_headers(out)
+				if step_dt is None:
+					step_dt = parse_ts(step.get("created_at")) or file_dt
+				call_dt = created_dt or step_dt
+				events.append({
+					"k": "sa",
+					"t": call_dt.isoformat(),
+					"tp": tn,
+					"rl": str(unquote(args.get("Role", ""))),
+				})
+				continue
+
+			srv = str(unquote(args.get("ServerName", "")))
+			tool = str(unquote(args.get("ToolName", "")))
+			if srv != "stealth-browser":
+				if any(k in srv.lower() for k in ("browser", "chrome", "playwright")):
+					out = generic_outputs[idx] if idx < len(generic_outputs) else ""
+					_, created_dt, _ = strip_agy_headers(out)
+					if step_dt is None:
+						step_dt = parse_ts(step.get("created_at")) or file_dt
+					call_dt = created_dt or step_dt
+					events.append({
+						"k": "om",
+						"t": call_dt.isoformat(),
+						"n": f"{srv}:{tool}",
+					})
+				continue
+
+			out = generic_outputs[idx] if idx < len(generic_outputs) else ""
+			body, created_dt, completed_dt = strip_agy_headers(out)
+			if step_dt is None:
+				step_dt = parse_ts(step.get("created_at")) or file_dt
+			call_dt = created_dt or step_dt
+			raw_args = normalize_args(args.get("Arguments", {}))
+			body, overflowed = expand_agy_overflow(body)
+			duration_s = (completed_dt - created_dt).total_seconds() if (created_dt and completed_dt) else None
+			ev = _extract_call_event(
+				tool=tool,
+				raw_args=raw_args,
+				body=body,
+				explicit_error=False,
+				duration_s=duration_s,
+				called_at=call_dt,
+				overflow=overflowed,
+			)
+			events.append(ev)
+			has_calls = True
+
+	if not events:
+		return {}
+	has_auth = bool(AUTH_RE.search(raw_bytes.decode("utf-8", errors="ignore"))) if has_calls else False
+	return {"e": events, "a": 1 if has_auth else 0}
+
+
+def _extract_opencode_item_events(
+	row_ts: Any,
+	item: dict[str, Any],
+) -> list[dict[str, Any]]:
+	call_id = str(item.get("id") or item.get("callID") or item.get("call_id") or "")
+	raw_name = str(item.get("name") or item.get("toolName") or item.get("tool") or "")
+	if raw_name not in ("read", "read_file", "shell", "execute", "bash"):
+		kind, tool = extract_opencode_tool_name(raw_name)
+		if kind is None or not tool:
+			return []
+	else:
+		kind, tool = None, None
+
+	state = item.get("state") if isinstance(item.get("state"), dict) else {}
+	start_dt, end_dt = extract_opencode_item_time(item)
+	if start_dt is None:
+		start_dt = parse_ts(row_ts)
+	ts_iso = start_dt.isoformat() if start_dt is not None else None
+
+	if kind == "other" and tool:
+		return [{"k": "om", "t": ts_iso, "n": f"opencode:{tool}", "cid": call_id}]
+
+	inp = normalize_args(item.get("args") or item.get("input") or state.get("input") or {})
+
+	if raw_name in ("read", "read_file"):
+		p = str(inp.get("path") or inp.get("filePath") or inp.get("Path") or "")
+		is_schema = "/mcp/stealth-browser/" in p
+		pl = p.lower()
+		is_ss_path = "screenshot" in pl or pl.endswith(".png")
+		if not (is_schema or is_ss_path):
+			return []
+		return [{
+			"k": "rf",
+			"t": ts_iso,
+			"ch": len(extract_opencode_output(item)[0]) if is_schema else 0,
+			"sc": 1 if is_schema else 0,
+			"ss": 1 if is_ss_path else 0,
+			"cid": call_id,
+		}]
+
+	if raw_name in ("shell", "execute", "bash"):
+		code = str(inp.get("command") or inp.get("code") or "")
+		if not code or "stealth" not in code.lower():
+			return []
+		meta = state.get("metadata") if isinstance(state.get("metadata"), dict) else {}
+		nested: list[tuple[str, dict[str, Any], bool]] = []
+		out_events: list[dict[str, Any]] = []
+		tool_calls = meta.get("toolCalls")
+		if isinstance(tool_calls, list) and tool_calls:
+			for tc in tool_calls:
+				if not isinstance(tc, dict):
+					continue
+				t_kind, ntool = extract_opencode_tool_name(str(tc.get("tool") or ""))
+				if t_kind == "other" and ntool:
+					out_events.append({"k": "om", "t": ts_iso, "n": f"opencode:{ntool}", "cid": call_id})
+					continue
+				if t_kind != "stealth-browser" or not ntool:
+					continue
+				nested.append((ntool, normalize_args(tc.get("input") or {}), str(tc.get("status") or "").lower() == "error"))
+		elif raw_name == "execute":
+			nested = [(m.group(1), {}, False) for m in NESTED_EXECUTE_RE.finditer(code)]
+		elif raw_name == "shell":
+			nested = extract_nested_shell_calls(code)
+		if not nested:
+			return out_events
+		body, explicit_err = extract_opencode_output(item)
+		if raw_name == "shell" and meta.get("exit") not in (None, 0):
+			explicit_err = True
+		duration_s = (end_dt - start_dt).total_seconds() if (start_dt and end_dt) else None
+		share = len(body) // len(nested)
+		last_share = share + (len(body) - share * len(nested))
+		errored_calls = [c for c in nested if c[2]]
+		for i, (ntool, raw_args, call_errored) in enumerate(nested):
+			is_last = i == len(nested) - 1
+			if len(nested) == 1:
+				call_err = explicit_err or call_errored
+				call_classify_body = None
+			elif call_errored:
+				call_err = True
+				call_classify_body = None if len(errored_calls) == 1 else ""
+			elif is_last and explicit_err and not errored_calls:
+				call_err = True
+				call_classify_body = None
+			elif is_last:
+				call_err = False
+				call_classify_body = None if not errored_calls else ""
+			else:
+				call_err = False
+				call_classify_body = ""
+			ev = _extract_call_event(
+				tool=ntool,
+				raw_args=raw_args,
+				body=body,
+				explicit_error=call_err,
+				duration_s=duration_s,
+				nested=True,
+				output_chars=last_share if is_last else share,
+				classify_body=call_classify_body,
+				called_at=start_dt,
+				shared_exec=(i == 0 and len(nested) > 1),
+			)
+			if call_id:
+				ev["cid"] = call_id
+			out_events.append(ev)
+		return out_events
+
+	if kind != "stealth-browser" or not tool:
+		return []
+	duration_s = (end_dt - start_dt).total_seconds() if (start_dt and end_dt) else None
+	body, explicit_err = extract_opencode_output(item)
+	ev = _extract_call_event(
+		tool=tool,
+		raw_args=inp,
+		body=body,
+		explicit_error=explicit_err,
+		duration_s=duration_s,
+		called_at=start_dt,
+	)
+	if call_id:
+		ev["cid"] = call_id
+	return [ev]
+
+
 class AuditCollector:
 	def __init__(
 		self,
@@ -697,12 +1102,20 @@ class AuditCollector:
 		excludes: list[str],
 		slow_threshold: float,
 		max_samples: int,
+		cache_dir: Optional[Path] = None,
+		use_cache: bool = True,
 	):
 		self.since = since
 		self.includes = includes
 		self.excludes = excludes
 		self.slow_threshold = slow_threshold
 		self.max_samples = max_samples
+		if cache_dir is not None:
+			self.cache_dir = cache_dir
+		else:
+			env_cache = os.environ.get("STEALTH_BROWSER_AUDIT_CACHE_DIR", "").strip()
+			self.cache_dir = Path(env_cache).expanduser() if env_cache else CACHE_DIR
+		self.use_cache = use_cache
 
 		self.sessions: list[dict[str, Any]] = []
 		self.call_records: list[dict[str, Any]] = []
@@ -748,28 +1161,38 @@ class AuditCollector:
 		self._matched_ids_by_source: dict[str, set[str]] = collections.defaultdict(set)
 		self._titles_by_source: dict[str, dict[str, str]] = {}
 
-	def _record_call(
+	def _apply_call_event(
 		self,
 		source: str,
 		sid: str,
 		title: str,
-		tool: str,
-		raw_args: dict[str, Any],
-		body: str,
-		explicit_error: bool,
-		duration_s: Optional[float],
+		ev: dict[str, Any],
 		sess_state: dict[str, Any],
-		nested: bool = False,
-		output_chars: Optional[int] = None,
-		classify_body: Optional[str] = None,
-		called_at: Optional[datetime.datetime] = None,
-		overflow: bool = False,
 	) -> None:
+		tool = ev["tool"]
+		chars = ev["ch"]
+		input_chars = ev["ich"]
+		called_at = parse_ts(ev.get("t"))
+		duration_s = ev.get("dur")
+		outcome = ev.get("out") or None
+		error_reason = ev.get("er", "")
+		overflow = bool(ev.get("ov"))
+		nested = bool(ev.get("ne"))
+		args_preview = ev.get("ap", "")
+		args_display = args_preview or "{}"
+		error_preview = ev.get("ep", "")
+		snap_rows = ev.get("sr", 0)
+
+		if not sess_state["date"] and called_at is not None:
+			sess_state["date"] = called_at.astimezone().strftime("%Y-%m-%d")
+		if overflow:
+			sess_state["overflows"] += 1
+		if ev.get("se"):
+			sess_state["shared_execute_outputs"] += 1
+
 		self.by_source[source] += 1
 		self.tool_counts[tool] += 1
-		chars = len(body) if output_chars is None else output_chars
 		self.call_chars[tool].append(chars)
-		input_chars = len(json.dumps(raw_args)) if raw_args else 0
 		self.call_input_chars[tool].append(input_chars)
 
 		sess_state["calls"] += 1
@@ -789,7 +1212,7 @@ class AuditCollector:
 		if tool == "snapshot":
 			sess_state["snapshot_calls"] += 1
 			sess_state["snapshot_chars"] += chars
-			sess_state["snapshot_rows"] += len(SNAPSHOT_ROW_RE.findall(body))
+			sess_state["snapshot_rows"] += snap_rows
 
 		if sess_state["prev_tool"] == tool:
 			self.consecutive_same_tool[tool] += 1
@@ -803,42 +1226,34 @@ class AuditCollector:
 				"source": source,
 				"sid": sid[:12],
 				"title": title[:40],
-				"args": raw_args,
-				"out": body[:160].replace("\n", " "),
+				"args": ev.get("hargs", {}),
+				"out": ev.get("hout", ""),
 			})
 
-		host = extract_domain(raw_args.get("url"))
+		host = ev.get("dom") or ""
 		if host:
 			self.domains[host] += 1
 			sess_state["domains"].add(host)
-		for m in URL_HOST_RE.findall(body[:4000]):
-			h = m.lower()
-			if h not in ("127.0.0.1", "localhost", "errors.pydantic.dev"):
-				sess_state["domains"].add(h)
+		for h in ev.get("bdom", ()):
+			sess_state["domains"].add(h)
 
-		if tool == "evaluate_js" and (not nested or raw_args):
-			expr = str(raw_args.get("expression") or raw_args.get("script") or (raw_args.get("code") if nested else "") or "")
-			intent, flags = classify_js_intent(expr)
+		if "ji" in ev:
+			intent = ev["ji"]
 			sess_state["last_js_intent"] = intent
 			self.js_intents[intent] += 1
-			for fl in flags:
+			for fl in ev.get("jf", ()):
 				self.js_flags[fl] += 1
 			if len(self.js_samples[intent]) < max(self.max_samples, 3):
 				self.js_samples[intent].append({
 					"sid": sid[:10],
 					"title": title[:35],
-					"expr": expr[:200].replace("\n", " "),
+					"expr": ev.get("je", ""),
 				})
 
-		classify_body = unwrap_result_json(body) if classify_body is None else classify_body
-		snip = classify_body
-		outcome = classify_outcome(tool, classify_body, explicit_error=explicit_error)
 		is_hard_error = bool(outcome and outcome not in SOFT_OUTCOMES)
-
-		if outcome != "validation_error":
-			silent_mismatch = detect_silent_param_mismatch(tool, raw_args)
-			if silent_mismatch:
-				self.silent_param_mismatches[silent_mismatch] += 1
+		silent_mismatch = ev.get("sm")
+		if silent_mismatch:
+			self.silent_param_mismatches[silent_mismatch] += 1
 
 		if duration_s is not None and duration_s >= 0:
 			if outcome == "mcp_timeout_3m":
@@ -848,32 +1263,29 @@ class AuditCollector:
 					"sid": sid[:10],
 					"title": title[:35],
 					"tool": tool,
-					"args": json.dumps(raw_args)[:100],
+					"args": args_display[:100],
 				})
 			elif duration_s > 180.0:
-				# AGY enforces a 180s MCP call timeout, so >180s non-timeout durations include user approval waits.
-				tail = body.splitlines()[-1][:140] if body.splitlines() else ""
 				self.approval_wait_calls.append({
 					"duration_s": round(duration_s, 1),
 					"source": source,
 					"sid": sid[:10],
 					"title": title[:35],
 					"tool": tool,
-					"args": json.dumps(raw_args)[:100],
-					"tail": tail,
+					"args": args_display[:100],
+					"tail": ev.get("tail", ""),
 				})
 			else:
 				self.call_latencies[tool].append(duration_s)
 				if duration_s >= self.slow_threshold:
-					tail = body.splitlines()[-1][:140] if body.splitlines() else ""
 					self.slow_calls.append({
 						"duration_s": round(duration_s, 1),
 						"source": source,
 						"sid": sid[:10],
 						"title": title[:35],
 						"tool": tool,
-						"args": json.dumps(raw_args)[:100],
-						"tail": tail,
+						"args": args_display[:100],
+						"tail": ev.get("tail", ""),
 					})
 		elif outcome == "mcp_timeout_3m":
 			self.mcp_timeouts.append({
@@ -882,10 +1294,9 @@ class AuditCollector:
 				"sid": sid[:10],
 				"title": title[:35],
 				"tool": tool,
-				"args": json.dumps(raw_args)[:100],
+				"args": args_display[:100],
 			})
 
-		error_reason = ""
 		if outcome in SOFT_OUTCOMES:
 			self.soft_counts[outcome] += 1
 			self.tool_soft[tool][outcome] += 1
@@ -899,37 +1310,30 @@ class AuditCollector:
 					"sid": sid[:10],
 					"title": title[:35],
 					"tool": tool,
-					"args": json.dumps(raw_args)[:140],
-					"out": snip[:220].replace("\n", " "),
+					"args": args_display[:140],
+					"out": error_preview,
 				})
-			if outcome == "validation_error":
-				sig = parse_validation_signature(tool, snip, raw_args)
-				self.validation_errors[sig] += 1
+			if outcome == "validation_error" and ev.get("vsig"):
+				self.validation_errors[ev["vsig"]] += 1
 			if tool == "click":
-				reason = classify_click_reason(outcome, snip)
-				error_reason = reason
-				self.click_reasons[reason] += 1
+				self.click_reasons[error_reason] += 1
 				if len(self.click_samples) < max(self.max_samples, 5):
 					self.click_samples.append({
 						"sid": sid[:10],
-						"selector": str(raw_args.get("selector", ""))[:80],
-						"reason": reason,
-						"out": snip[:180].replace("\n", " "),
+						"selector": ev.get("sel", ""),
+						"reason": error_reason,
+						"out": error_preview[:180],
 					})
 			elif tool == "status":
-				reason = classify_status_reason(outcome, snip)
-				error_reason = reason
-				self.status_reasons[reason] += 1
+				self.status_reasons[error_reason] += 1
 				if len(self.status_samples) < max(self.max_samples, 5):
 					self.status_samples.append({
 						"sid": sid[:10],
-						"reason": reason,
-						"out": snip[:180].replace("\n", " "),
+						"reason": error_reason,
+						"out": error_preview[:180],
 					})
 			elif tool == "navigate":
-				reason = classify_navigate_reason(outcome, snip)
-				error_reason = reason
-				self.navigate_reasons[reason] += 1
+				self.navigate_reasons[error_reason] += 1
 
 		self.call_records.append({
 			"source": source,
@@ -938,27 +1342,62 @@ class AuditCollector:
 			"called_at": called_at,
 			"tool": tool,
 			"outcome": outcome or "",
-			"is_error": bool(outcome and outcome not in SOFT_OUTCOMES),
+			"is_error": is_hard_error,
 			"is_soft": outcome in SOFT_OUTCOMES,
 			"error_detail": error_reason,
 			"js_intent": sess_state.get("last_js_intent", "") if tool == "evaluate_js" else "",
-			"domain": extract_domain(raw_args.get("url")) or "",
+			"domain": host,
 			"output_chars": chars,
 			"input_chars": input_chars,
 			"is_overflow": overflow,
-			"snapshot_rows": len(SNAPSHOT_ROW_RE.findall(body)) if tool == "snapshot" else 0,
+			"snapshot_rows": snap_rows if tool == "snapshot" else 0,
 			"duration_s": duration_s,
 			"is_approval_wait": bool(
 				duration_s is not None and outcome != "mcp_timeout_3m" and duration_s > 180.0
 			),
 			"nested": nested,
-			"args_preview": json.dumps(raw_args)[:140] if raw_args else "",
-			"error_preview": snip[:220].replace("\n", " ") if outcome else "",
+			"args_preview": args_preview,
+			"error_preview": error_preview if outcome else "",
 		})
 
 		sess_state["prev_tool"] = tool
 		sess_state["prev_errored"] = is_hard_error
 		sess_state["prev_was_screenshot"] = tool == "screenshot"
+
+	def _record_call(
+		self,
+		source: str,
+		sid: str,
+		title: str,
+		tool: str,
+		raw_args: dict[str, Any],
+		body: str,
+		explicit_error: bool,
+		duration_s: Optional[float],
+		sess_state: dict[str, Any],
+		nested: bool = False,
+		output_chars: Optional[int] = None,
+		classify_body: Optional[str] = None,
+		called_at: Optional[datetime.datetime] = None,
+		overflow: bool = False,
+	) -> None:
+		ev = _extract_call_event(
+			tool=tool,
+			raw_args=raw_args,
+			body=body,
+			explicit_error=explicit_error,
+			duration_s=duration_s,
+			nested=nested,
+			output_chars=output_chars,
+			classify_body=classify_body,
+			called_at=called_at,
+			overflow=overflow,
+		)
+		if overflow:
+			ev["ov"] = 0
+		self._apply_call_event(source, sid, title, ev, sess_state)
+		if overflow:
+			self.call_records[-1]["is_overflow"] = True
 
 	def _finalize_session(
 		self,
@@ -1005,6 +1444,40 @@ class AuditCollector:
 			"is_subagent": any(b["sid"] == sid for b in self.browser_subagents),
 		})
 
+	def _replay_session_event(
+		self,
+		source: str,
+		sid: str,
+		title: str,
+		ev: dict[str, Any],
+		sess_state: dict[str, Any],
+	) -> None:
+		ev_dt = parse_ts(ev.get("t"))
+		if self.since is not None and ev_dt is not None and ev_dt < self.since:
+			return
+		kind = ev["k"]
+		if kind == "rf":
+			if ev.get("sc"):
+				sess_state["schema_reads"] += 1
+				sess_state["schema_chars"] += ev.get("ch", 0)
+			if ev.get("ss") and sess_state["prev_was_screenshot"]:
+				self.screenshot_followed_by_read += 1
+				sess_state["prev_was_screenshot"] = False
+			return
+		if kind == "sa":
+			self.browser_subagents.append({
+				"sid": sid[:10],
+				"title": title[:40],
+				"type": ev["tp"],
+				"role": ev.get("rl", ""),
+			})
+			return
+		if kind == "om":
+			self.other_browser_mcps[ev["n"]] += 1
+			return
+		if kind == "c":
+			self._apply_call_event(source, sid, title, ev, sess_state)
+
 	def collect_agy(self) -> None:
 		if not BRAIN_DIR.exists():
 			return
@@ -1013,158 +1486,84 @@ class AuditCollector:
 		self._titles_by_source["agy"] = titles
 		paths = _iter_agy_transcripts(BRAIN_DIR)
 		matched_ids: set[str] = set()
-		target_paths: list[tuple[str, str]] = []
+
+		cache = SessionCache(self.cache_dir) if self.use_cache else None
+		cached_agy = cache.load_source("agy") if cache is not None else {}
+
+		ordered_work: list[tuple[str, str, Any]] = []
+		dirty_entries: list[tuple[str, str, int, int]] = []
 
 		for cid, path_str in paths:
 			if self.includes and matches_any_prefix(cid, self.includes):
 				matched_ids.add(cid)
 			if not should_audit_session(cid, self.includes, self.excludes):
 				continue
-			target_paths.append((cid, path_str))
+			try:
+				st = os.stat(path_str)
+			except OSError:
+				continue
+			if self.since is not None:
+				file_dt = datetime.datetime.fromtimestamp(st.st_mtime, tz=datetime.timezone.utc)
+				if file_dt < self.since:
+					continue
+			hit = cached_agy.get(cid)
+			if hit is not None and hit[0] == path_str and hit[1] == st.st_mtime_ns and hit[2] == st.st_size:
+				ordered_work.append(("hit", cid, hit[3]))
+			else:
+				ordered_work.append(("miss", cid, len(dirty_entries)))
+				dirty_entries.append((cid, path_str, st.st_mtime_ns, st.st_size))
 
-		if len(target_paths) > 16:
+		def parse_and_extract(entry: tuple[str, str, int, int]) -> tuple[str, str, int, int, dict[str, Any]]:
+			cid_val, p_str, mtime_ns, size = entry
+			parsed = _parse_agy_file(cid_val, p_str, None)
+			if parsed is None or not parsed[2]:
+				return cid_val, p_str, mtime_ns, size, {}
+			_, file_dt_val, turns, raw_bytes = parsed
+			payload_obj = _extract_agy_session_payload(file_dt_val, turns, raw_bytes)
+			return cid_val, p_str, mtime_ns, size, payload_obj
+
+		if len(dirty_entries) > 16:
 			with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-				parsed_results = list(
-					pool.map(lambda pair: _parse_agy_file(pair[0], pair[1], self.since), target_paths)
-				)
+				dirty_results = list(pool.map(parse_and_extract, dirty_entries))
 		else:
-			parsed_results = [_parse_agy_file(cid, path_str, self.since) for cid, path_str in target_paths]
+			dirty_results = [parse_and_extract(entry) for entry in dirty_entries]
 
-		for parsed in parsed_results:
-			if parsed is None:
-				continue
-			cid, file_dt, turns, raw_bytes = parsed
-			if not turns:
-				continue
+		if cache is not None and dirty_results:
+			cache.upsert_many([
+				(
+					"agy",
+					cid_val,
+					p_str,
+					mtime_ns,
+					size,
+					json.dumps(payload_obj, separators=(",", ":")) if payload_obj else "",
+				)
+				for cid_val, p_str, mtime_ns, size, payload_obj in dirty_results
+			])
+		if cache is not None:
+			cache.close()
 
-			sess_state: dict[str, Any] = {
-				"calls": 0,
-				"errors": 0,
-				"schema_reads": 0,
-				"chars": 0,
-				"input_chars": 0,
-				"schema_chars": 0,
-				"overflows": 0,
-				"shared_execute_outputs": 0,
-				"domains": set(),
-				"tools": collections.Counter(),
-				"date": "",
-				"prev_tool": None,
-				"prev_errored": False,
-				"prev_was_screenshot": False,
-				"first_call_at": None,
-				"last_call_at": None,
-				"snapshot_calls": 0,
-				"snapshot_chars": 0,
-				"snapshot_rows": 0,
-				"last_js_intent": "",
-			}
+		for kind, cid, data in ordered_work:
+			if kind == "hit":
+				if not data:
+					continue
+				try:
+					payload_obj = json.loads(data)
+				except Exception:
+					continue
+			else:
+				payload_obj = dirty_results[data][4]
+				if not payload_obj:
+					continue
+
+			events = payload_obj.get("e") or []
+			if not events:
+				continue
+			sess_state = _new_sess_state()
 			title = titles.get(cid, "")
-
-			for step, generic_outputs in turns:
-				tcs = step.get("tool_calls") or []
-				step_dt: Optional[datetime.datetime] = None
-
-				for idx, tc in enumerate(tcs):
-					name = tc.get("name", "")
-					if name not in ("call_mcp_tool", "read_file", "invoke_subagent"):
-						continue
-					args = tc.get("args") or {}
-
-					if name == "read_file":
-						p = str(unquote(args.get("Path", "")))
-						is_schema = "/mcp/stealth-browser/" in p
-						is_ss_read = sess_state["prev_was_screenshot"] and (
-							"screenshot" in p.lower() or p.lower().endswith(".png")
-						)
-						if not (is_schema or is_ss_read):
-							continue
-						out = generic_outputs[idx] if idx < len(generic_outputs) else ""
-						body, created_dt, _ = strip_agy_headers(out)
-						if step_dt is None:
-							step_dt = parse_ts(step.get("created_at")) or file_dt
-						call_dt = created_dt or step_dt
-						if self.since is not None and call_dt < self.since:
-							continue
-						if is_schema:
-							sess_state["schema_reads"] += 1
-							sess_state["schema_chars"] += len(body)
-						if is_ss_read:
-							self.screenshot_followed_by_read += 1
-							sess_state["prev_was_screenshot"] = False
-						continue
-
-					if name == "invoke_subagent":
-						tn = str(unquote(args.get("TypeName", "")))
-						if "browser" not in tn.lower():
-							continue
-						out = generic_outputs[idx] if idx < len(generic_outputs) else ""
-						_, created_dt, _ = strip_agy_headers(out)
-						if step_dt is None:
-							step_dt = parse_ts(step.get("created_at")) or file_dt
-						call_dt = created_dt or step_dt
-						if self.since is not None and call_dt < self.since:
-							continue
-						self.browser_subagents.append({
-							"sid": cid[:10],
-							"title": title[:40],
-							"type": tn,
-							"role": str(unquote(args.get("Role", ""))),
-						})
-						continue
-
-					srv = str(unquote(args.get("ServerName", "")))
-					tool = str(unquote(args.get("ToolName", "")))
-
-					if srv != "stealth-browser":
-						if any(k in srv.lower() for k in ("browser", "chrome", "playwright")):
-							out = generic_outputs[idx] if idx < len(generic_outputs) else ""
-							_, created_dt, _ = strip_agy_headers(out)
-							if step_dt is None:
-								step_dt = parse_ts(step.get("created_at")) or file_dt
-							call_dt = created_dt or step_dt
-							if self.since is None or call_dt >= self.since:
-								self.other_browser_mcps[f"{srv}:{tool}"] += 1
-						continue
-
-					out = generic_outputs[idx] if idx < len(generic_outputs) else ""
-					body, created_dt, completed_dt = strip_agy_headers(out)
-					if step_dt is None:
-						step_dt = parse_ts(step.get("created_at")) or file_dt
-					call_dt = created_dt or step_dt
-					if self.since is not None and call_dt < self.since:
-						continue
-
-					raw_args = normalize_args(args.get("Arguments", {}))
-					if not sess_state["date"]:
-						sess_state["date"] = call_dt.astimezone().strftime("%Y-%m-%d")
-
-					body, overflowed = expand_agy_overflow(body)
-					if overflowed:
-						sess_state["overflows"] += 1
-
-					duration_s: Optional[float] = None
-					if created_dt and completed_dt:
-						duration_s = (completed_dt - created_dt).total_seconds()
-
-					self._record_call(
-						source="agy",
-						sid=cid,
-						title=title,
-						tool=tool,
-						raw_args=raw_args,
-						body=body,
-						explicit_error=False,
-						duration_s=duration_s,
-						sess_state=sess_state,
-						called_at=call_dt,
-						overflow=overflowed,
-					)
-
-			has_auth = False
-			if sess_state["calls"] > 0:
-				has_auth = bool(AUTH_RE.search(raw_bytes.decode("utf-8", errors="ignore")))
-			self._finalize_session("agy", cid, title, sess_state, has_auth=has_auth)
+			for ev in events:
+				self._replay_session_event("agy", cid, title, ev, sess_state)
+			self._finalize_session("agy", cid, title, sess_state, has_auth=bool(payload_obj.get("a")))
 
 		self._matched_ids_by_source["agy"] = matched_ids
 
@@ -1258,202 +1657,350 @@ class AuditCollector:
 		self._sources_collected.add("opencode")
 		db_paths = sorted(p for p in OPENCODE_DIR.glob("opencode*.db") if p.is_file())
 		seen_call_ids: set[str] = set()
+		cache = SessionCache(self.cache_dir) if self.use_cache else None
+		cached_oc = cache.load_source("opencode") if cache is not None else {}
 
-		for db_path in db_paths:
-			try:
-				conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-			except sqlite3.Error:
-				continue
+		try:
+			for db_path in db_paths:
+				try:
+					conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+				except sqlite3.Error:
+					continue
 
-			try:
-				cur = conn.cursor()
-				tables = {r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-				sess_table = "session_v2" if "session_v2" in tables else ("session" if "session" in tables else None)
-				titles: dict[str, str] = {}
-				if sess_table:
-					for sid, title in cur.execute(f"SELECT id, title FROM {sess_table}"):
-						titles[str(sid)] = str(title or "")
-				self._titles_by_source["opencode"] = titles
-				if self.includes and sess_table:
-					for (sidv,) in cur.execute(f"SELECT id FROM {sess_table}"):
-						sidv = str(sidv)
-						if matches_any_prefix(sidv, self.includes):
-							self._matched_ids_by_source["opencode"].add(sidv)
+				try:
+					cur = conn.cursor()
+					tables = {r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+					sess_table = "session_v2" if "session_v2" in tables else ("session" if "session" in tables else None)
+					titles: dict[str, str] = {}
+					sess_updated: dict[str, Any] = {}
+					has_time_updated = False
+					if sess_table:
+						sess_cols = {r[1] for r in cur.execute(f"PRAGMA table_info({sess_table})")}
+						has_time_updated = "time_updated" in sess_cols
+						if has_time_updated:
+							for sid, title, tu in cur.execute(f"SELECT id, title, time_updated FROM {sess_table}"):
+								sid_s = str(sid)
+								titles[sid_s] = str(title or "")
+								sess_updated[sid_s] = tu
+						else:
+							for sid, title in cur.execute(f"SELECT id, title FROM {sess_table}"):
+								titles[str(sid)] = str(title or "")
+					self._titles_by_source["opencode"] = titles
+					if self.includes and sess_table:
+						for sidv in titles:
+							if matches_any_prefix(sidv, self.includes):
+								self._matched_ids_by_source["opencode"].add(sidv)
 
-				per_session: dict[str, dict[str, Any]] = {}
-				per_session_text: dict[str, list[str]] = collections.defaultdict(list)
+					if cache is not None and sess_table and has_time_updated:
+						db_key = str(db_path)
+						active_payloads: dict[str, dict[str, Any]] = {}
+						dirty_sids: list[str] = []
+						total_eligible = 0
+						for sid, tu in sess_updated.items():
+							if not should_audit_session(sid, self.includes, self.excludes):
+								continue
+							if self.since is not None and isinstance(tu, (int, float)):
+								cutoff_s = self.since.timestamp() - 3600.0
+								cutoff = cutoff_s * 1000.0 if tu > 1e11 else cutoff_s
+								if tu < cutoff:
+									continue
+							total_eligible += 1
+							ckey = f"{db_path.name}:{sid}"
+							hit = cached_oc.get(ckey)
+							if tu is not None and hit is not None and hit[0] == db_key and hit[1] == int(tu) and hit[2] == 0:
+								if hit[3]:
+									try:
+										active_payloads[sid] = json.loads(hit[3])
+									except Exception:
+										dirty_sids.append(sid)
+							else:
+								dirty_sids.append(sid)
 
-				def get_sess(sid: str) -> dict[str, Any]:
-					if sid not in per_session:
-						per_session[sid] = {
-							"calls": 0,
-							"errors": 0,
-							"schema_reads": 0,
-							"chars": 0,
-							"input_chars": 0,
-							"schema_chars": 0,
-							"overflows": 0,
-							"shared_execute_outputs": 0,
-							"domains": set(),
-							"tools": collections.Counter(),
-							"date": "",
-							"prev_tool": None,
-							"prev_errored": False,
-							"prev_was_screenshot": False,
-							"first_call_at": None,
-							"last_call_at": None,
-							"snapshot_calls": 0,
-							"snapshot_chars": 0,
-							"snapshot_rows": 0,
-							"last_js_intent": "",
-						}
-					return per_session[sid]
+						if dirty_sids:
+							dirty_set = set(dirty_sids)
+							dirty_events: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
+							dirty_text: dict[str, list[str]] = collections.defaultdict(list)
+							query_all = len(dirty_sids) >= max(total_eligible, 1) and not self.includes
 
-				def handle_tool_item(sid: str, row_ts: Any, item: dict[str, Any]) -> None:
-					if not should_audit_session(sid, self.includes, self.excludes):
-						return
-					call_id = str(item.get("id") or item.get("callID") or item.get("call_id") or "")
-					if call_id:
-						if call_id in seen_call_ids:
+							def fetch_table_rows(tbl: str, base_where: str) -> list[tuple[int, str, Any, str]]:
+								if query_all:
+									return cur.execute(
+										f"SELECT rowid, session_id, time_created, data FROM {tbl} WHERE {base_where} ORDER BY rowid"
+									).fetchall()
+								out_rows: list[tuple[int, str, Any, str]] = []
+								for start in range(0, len(dirty_sids), 400):
+									chunk = dirty_sids[start:start + 400]
+									placeholders = ",".join("?" for _ in chunk)
+									out_rows.extend(
+										cur.execute(
+											f"SELECT rowid, session_id, time_created, data FROM {tbl} "
+											f"WHERE {base_where} AND session_id IN ({placeholders}) ORDER BY rowid",
+											chunk,
+										).fetchall()
+									)
+								out_rows.sort(key=lambda r: r[0])
+								return out_rows
+
+							if "session_message" in tables:
+								rows = fetch_table_rows(
+									"session_message",
+									"(data LIKE '%stealth%' OR data LIKE '%playwright%' OR data LIKE '%chrome%')",
+								)
+								for rowid, sid, tc, raw in rows:
+									sid_s = str(sid)
+									if sid_s not in dirty_set:
+										continue
+									dirty_text[sid_s].append(raw[:2000])
+									try:
+										obj = json.loads(raw)
+									except Exception:
+										continue
+									content = obj.get("content")
+									if not isinstance(content, list):
+										continue
+									for ii, item in enumerate(content):
+										if isinstance(item, dict) and item.get("type") in ("tool", "tool-call", "tool_use"):
+											evs = _extract_opencode_item_events(tc, item)
+											for sub_i, ev in enumerate(evs):
+												ev["db"] = 0
+												ev["r"] = rowid
+												ev["ii"] = ii
+												ev["si"] = sub_i
+												dirty_events[sid_s].append(ev)
+
+							for tbl_idx, part_table in enumerate(("session_part", "part"), start=1):
+								if part_table not in tables:
+									continue
+								rows = fetch_table_rows(
+									part_table,
+									"type = 'tool' AND (data LIKE '%stealth%' OR data LIKE '%playwright%' OR data LIKE '%chrome%')",
+								)
+								for rowid, sid, tc, raw in rows:
+									sid_s = str(sid)
+									if sid_s not in dirty_set:
+										continue
+									dirty_text[sid_s].append(raw[:2000])
+									try:
+										item = json.loads(raw)
+									except Exception:
+										continue
+									if isinstance(item, dict):
+										evs = _extract_opencode_item_events(tc, item)
+										for sub_i, ev in enumerate(evs):
+											ev["db"] = tbl_idx
+											ev["r"] = rowid
+											ev["ii"] = 0
+											ev["si"] = sub_i
+											dirty_events[sid_s].append(ev)
+
+							to_upsert: list[tuple[str, str, str, int, int, str]] = []
+							for sid in dirty_sids:
+								evs = dirty_events.get(sid) or []
+								if evs:
+									has_calls = any(ev["k"] == "c" for ev in evs)
+									has_auth = bool(AUTH_RE.search(" ".join(dirty_text.get(sid, [])))) if has_calls else False
+									payload_obj = {"e": evs, "a": 1 if has_auth else 0}
+									active_payloads[sid] = payload_obj
+									payload_str = json.dumps(payload_obj, separators=(",", ":"))
+								else:
+									payload_str = ""
+								tu = sess_updated.get(sid)
+								if tu is not None:
+									to_upsert.append(("opencode", f"{db_path.name}:{sid}", db_key, int(tu), 0, payload_str))
+							if to_upsert:
+								cache.upsert_many(to_upsert)
+
+						merged: list[tuple[int, int, int, int, str, dict[str, Any]]] = []
+						for sid, payload_obj in active_payloads.items():
+							for ev in payload_obj.get("e") or ():
+								merged.append((ev.get("db", 0), ev.get("r", 0), ev.get("ii", 0), ev.get("si", 0), sid, ev))
+						merged.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
+
+						per_session: dict[str, dict[str, Any]] = {}
+						seen_call_item: dict[str, tuple[int, int, int]] = {}
+						for db_i, rowid, ii, _si, sid, ev in merged:
+							cid_val = ev.get("cid") or ""
+							if cid_val:
+								item_key = (db_i, rowid, ii)
+								prev_key = seen_call_item.get(cid_val)
+								if prev_key is not None:
+									if prev_key != item_key:
+										continue
+								elif cid_val in seen_call_ids:
+									continue
+								else:
+									seen_call_item[cid_val] = item_key
+									seen_call_ids.add(cid_val)
+							if sid not in per_session:
+								per_session[sid] = _new_sess_state()
+							self._replay_session_event("opencode", sid, titles.get(sid, ""), ev, per_session[sid])
+
+						for sid, sess_state in per_session.items():
+							self._finalize_session(
+								"opencode",
+								sid,
+								titles.get(sid, ""),
+								sess_state,
+								has_auth=bool(active_payloads[sid].get("a")),
+							)
+						continue
+
+					per_session = {}
+					per_session_text: dict[str, list[str]] = collections.defaultdict(list)
+
+					def get_sess(sid: str) -> dict[str, Any]:
+						if sid not in per_session:
+							per_session[sid] = _new_sess_state()
+						return per_session[sid]
+
+					def handle_tool_item(sid: str, row_ts: Any, item: dict[str, Any]) -> None:
+						if not should_audit_session(sid, self.includes, self.excludes):
 							return
-						seen_call_ids.add(call_id)
+						call_id = str(item.get("id") or item.get("callID") or item.get("call_id") or "")
+						if call_id:
+							if call_id in seen_call_ids:
+								return
+							seen_call_ids.add(call_id)
 
-					raw_name = str(item.get("name") or item.get("toolName") or item.get("tool") or "")
-					if raw_name not in ("read", "read_file", "shell", "execute", "bash"):
-						kind, tool = extract_opencode_tool_name(raw_name)
-						if kind is None or not tool:
+						raw_name = str(item.get("name") or item.get("toolName") or item.get("tool") or "")
+						if raw_name not in ("read", "read_file", "shell", "execute", "bash"):
+							kind, tool = extract_opencode_tool_name(raw_name)
+							if kind is None or not tool:
+								return
+						else:
+							kind, tool = None, None
+
+						state = item.get("state") if isinstance(item.get("state"), dict) else {}
+						start_dt, end_dt = extract_opencode_item_time(item)
+						if start_dt is None:
+							start_dt = parse_ts(row_ts)
+						if self.since is not None and start_dt is not None and start_dt < self.since:
 							return
-					else:
-						kind, tool = None, None
 
-					state = item.get("state") if isinstance(item.get("state"), dict) else {}
-					start_dt, end_dt = extract_opencode_item_time(item)
-					if start_dt is None:
-						start_dt = parse_ts(row_ts)
-					if self.since is not None and start_dt is not None and start_dt < self.since:
-						return
+						if kind == "other" and tool:
+							self.other_browser_mcps[f"opencode:{tool}"] += 1
+							return
 
-					if kind == "other" and tool:
-						self.other_browser_mcps[f"opencode:{tool}"] += 1
-						return
+						inp = normalize_args(item.get("args") or item.get("input") or state.get("input") or {})
+						sess_state = get_sess(sid)
 
-					inp = normalize_args(item.get("args") or item.get("input") or state.get("input") or {})
-					sess_state = get_sess(sid)
+						if raw_name in ("read", "read_file"):
+							p = str(inp.get("path") or inp.get("filePath") or inp.get("Path") or "")
+							if "/mcp/stealth-browser/" in p:
+								sess_state["schema_reads"] += 1
+								sess_state["schema_chars"] += len(extract_opencode_output(item)[0])
+							if sess_state["prev_was_screenshot"] and ("screenshot" in p.lower() or p.lower().endswith(".png")):
+								self.screenshot_followed_by_read += 1
+								sess_state["prev_was_screenshot"] = False
+							return
 
-					if raw_name in ("read", "read_file"):
-						p = str(inp.get("path") or inp.get("filePath") or inp.get("Path") or "")
-						if "/mcp/stealth-browser/" in p:
-							sess_state["schema_reads"] += 1
-							sess_state["schema_chars"] += len(extract_opencode_output(item)[0])
-						if sess_state["prev_was_screenshot"] and ("screenshot" in p.lower() or p.lower().endswith(".png")):
-							self.screenshot_followed_by_read += 1
-							sess_state["prev_was_screenshot"] = False
-						return
+						if raw_name in ("shell", "execute", "bash"):
+							self._record_nested_calls(
+								sid=sid,
+								title=titles.get(sid, ""),
+								kind=raw_name,
+								code=str(inp.get("command") or inp.get("code") or ""),
+								item=item,
+								start_dt=start_dt,
+								end_dt=end_dt,
+								sess_state=sess_state,
+							)
+							return
 
-					if raw_name in ("shell", "execute", "bash"):
-						self._record_nested_calls(
+						if kind != "stealth-browser" or not tool:
+							return
+
+						if not sess_state["date"] and start_dt:
+							sess_state["date"] = start_dt.astimezone().strftime("%Y-%m-%d")
+
+						duration_s: Optional[float] = None
+						if start_dt and end_dt:
+							duration_s = (end_dt - start_dt).total_seconds()
+
+						body, explicit_err = extract_opencode_output(item)
+						self._record_call(
+							source="opencode",
 							sid=sid,
 							title=titles.get(sid, ""),
-							kind=raw_name,
-							code=str(inp.get("command") or inp.get("code") or ""),
-							item=item,
-							start_dt=start_dt,
-							end_dt=end_dt,
+							tool=tool,
+							raw_args=inp,
+							body=body,
+							explicit_error=explicit_err,
+							duration_s=duration_s,
 							sess_state=sess_state,
+							called_at=start_dt,
 						)
-						return
 
-					if kind != "stealth-browser" or not tool:
-						return
+					if "session_message" in tables:
+						extra_where, extra_params = _build_opencode_filters(
+							cur, "session_message", self.includes, self.since, sess_table
+						)
+						sql = (
+							"SELECT session_id, time_created, data FROM session_message "
+							"WHERE (data LIKE '%stealth%' OR data LIKE '%playwright%' OR data LIKE '%chrome%')"
+						)
+						if extra_where:
+							sql += f" AND {extra_where} ORDER BY rowid"
+						rows = cur.execute(sql, extra_params).fetchall()
+						for sid, tc, raw in rows:
+							sid = str(sid)
+							if not should_audit_session(sid, self.includes, self.excludes):
+								continue
+							per_session_text[sid].append(raw[:2000])
+							try:
+								obj = json.loads(raw)
+							except Exception:
+								continue
+							content = obj.get("content")
+							if not isinstance(content, list):
+								continue
+							for item in content:
+								if isinstance(item, dict) and item.get("type") in ("tool", "tool-call", "tool_use"):
+									handle_tool_item(sid, tc, item)
 
-					if not sess_state["date"] and start_dt:
-						sess_state["date"] = start_dt.astimezone().strftime("%Y-%m-%d")
-
-					duration_s: Optional[float] = None
-					if start_dt and end_dt:
-						duration_s = (end_dt - start_dt).total_seconds()
-
-					body, explicit_err = extract_opencode_output(item)
-					self._record_call(
-						source="opencode",
-						sid=sid,
-						title=titles.get(sid, ""),
-						tool=tool,
-						raw_args=inp,
-						body=body,
-						explicit_error=explicit_err,
-						duration_s=duration_s,
-						sess_state=sess_state,
-						called_at=start_dt,
-					)
-
-				if "session_message" in tables:
-					extra_where, extra_params = _build_opencode_filters(
-						cur, "session_message", self.includes, self.since, sess_table
-					)
-					sql = (
-						"SELECT session_id, time_created, data FROM session_message "
-						"WHERE (data LIKE '%stealth%' OR data LIKE '%playwright%' OR data LIKE '%chrome%')"
-					)
-					if extra_where:
-						sql += f" AND {extra_where} ORDER BY rowid"
-					rows = cur.execute(sql, extra_params).fetchall()
-					for sid, tc, raw in rows:
-						sid = str(sid)
-						if not should_audit_session(sid, self.includes, self.excludes):
+					for part_table in ("session_part", "part"):
+						if part_table not in tables:
 							continue
-						per_session_text[sid].append(raw[:2000])
-						try:
-							obj = json.loads(raw)
-						except Exception:
-							continue
-						content = obj.get("content")
-						if not isinstance(content, list):
-							continue
-						for item in content:
-							if isinstance(item, dict) and item.get("type") in ("tool", "tool-call", "tool_use"):
+						extra_where, extra_params = _build_opencode_filters(
+							cur, part_table, self.includes, self.since, sess_table
+						)
+						sql = (
+							f"SELECT session_id, time_created, data FROM {part_table} "
+							"WHERE type = 'tool' AND (data LIKE '%stealth%' OR data LIKE '%playwright%' OR data LIKE '%chrome%')"
+						)
+						if extra_where:
+							sql += f" AND {extra_where} ORDER BY rowid"
+						rows = cur.execute(sql, extra_params).fetchall()
+						for sid, tc, raw in rows:
+							sid = str(sid)
+							if not should_audit_session(sid, self.includes, self.excludes):
+								continue
+							per_session_text[sid].append(raw[:2000])
+							try:
+								item = json.loads(raw)
+							except Exception:
+								continue
+							if isinstance(item, dict):
 								handle_tool_item(sid, tc, item)
 
-				for part_table in ("session_part", "part"):
-					if part_table not in tables:
-						continue
-					extra_where, extra_params = _build_opencode_filters(
-						cur, part_table, self.includes, self.since, sess_table
-					)
-					sql = (
-						f"SELECT session_id, time_created, data FROM {part_table} "
-						"WHERE type = 'tool' AND (data LIKE '%stealth%' OR data LIKE '%playwright%' OR data LIKE '%chrome%')"
-					)
-					if extra_where:
-						sql += f" AND {extra_where} ORDER BY rowid"
-					rows = cur.execute(sql, extra_params).fetchall()
-					for sid, tc, raw in rows:
-						sid = str(sid)
-						if not should_audit_session(sid, self.includes, self.excludes):
-							continue
-						per_session_text[sid].append(raw[:2000])
-						try:
-							item = json.loads(raw)
-						except Exception:
-							continue
-						if isinstance(item, dict):
-							handle_tool_item(sid, tc, item)
-
-				for sid, sess_state in per_session.items():
-					has_auth = False
-					if sess_state["calls"] > 0:
-						has_auth = bool(AUTH_RE.search(" ".join(per_session_text.get(sid, []))))
-					self._finalize_session(
-						"opencode",
-						sid,
-						titles.get(sid, ""),
-						sess_state,
-						has_auth=has_auth,
-					)
-			except sqlite3.Error:
-				pass
-			finally:
-				conn.close()
+					for sid, sess_state in per_session.items():
+						has_auth = False
+						if sess_state["calls"] > 0:
+							has_auth = bool(AUTH_RE.search(" ".join(per_session_text.get(sid, []))))
+						self._finalize_session(
+							"opencode",
+							sid,
+							titles.get(sid, ""),
+							sess_state,
+							has_auth=has_auth,
+						)
+				except sqlite3.Error:
+					pass
+				finally:
+					conn.close()
+		finally:
+			if cache is not None:
+				cache.close()
 
 	def _compute_session_match(self) -> dict[str, Any]:
 		if not self.includes:
@@ -1996,6 +2543,16 @@ def build_parser() -> argparse.ArgumentParser:
 		metavar="BASELINE_JSON",
 		help="Compare current audit against a previously saved JSON baseline.",
 	)
+	parser.add_argument(
+		"--cache-dir",
+		metavar="DIR",
+		help="Directory for incremental per-session SQLite cache (default: ~/.cache/stealth-browser-audit or STEALTH_BROWSER_AUDIT_CACHE_DIR).",
+	)
+	parser.add_argument(
+		"--no-cache",
+		action="store_true",
+		help="Disable reading and writing the incremental per-session cache.",
+	)
 	return parser
 
 
@@ -2020,12 +2577,15 @@ def main() -> int:
 	if env_cid and not matches_any_prefix(env_cid, includes) and env_cid not in excludes:
 		excludes.append(env_cid)
 
+	cache_dir = Path(args.cache_dir).expanduser() if args.cache_dir else None
 	collector = AuditCollector(
 		since=since_dt,
 		includes=includes,
 		excludes=excludes,
 		slow_threshold=args.slow_threshold,
 		max_samples=max(args.samples, 0),
+		cache_dir=cache_dir,
+		use_cache=not args.no_cache,
 	)
 	if args.source in ("all", "agy"):
 		collector.collect_agy()
