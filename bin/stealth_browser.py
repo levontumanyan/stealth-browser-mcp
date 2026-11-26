@@ -2609,7 +2609,7 @@ async def batch(actions: list[dict], tab: Union[int, str] = -1) -> str:
 						await loc.click(timeout=timeout)
 				except Exception:
 					if ref_id:
-						if matched is None:
+						if not force and matched is None:
 							matched = await _locator_has_match(loc)
 						if (not matched or force) and await _js_click_ref(page, ref_id):
 							pass
@@ -2630,7 +2630,7 @@ async def batch(actions: list[dict], tab: Union[int, str] = -1) -> str:
 					await loc.fill(text_val, timeout=timeout, force=force)
 				except Exception:
 					if ref_id:
-						if matched is None:
+						if not force and matched is None:
 							matched = await _locator_has_match(loc)
 						if (not matched or force) and await _js_type_ref(page, ref_id, text_val, clear_first=True, press_enter=False):
 							pass
@@ -2655,7 +2655,7 @@ async def batch(actions: list[dict], tab: Union[int, str] = -1) -> str:
 						await loc.press("Enter")
 				except Exception:
 					if ref_id:
-						if matched is None:
+						if not force and matched is None:
 							matched = await _locator_has_match(loc)
 						if (not matched or force) and await _js_type_ref(page, ref_id, text_val, clear_first=False, press_enter=press_enter):
 							pass
@@ -2980,7 +2980,7 @@ async def click(
 				await locator.click(timeout=timeout_ms)
 		except Exception:
 			if ref_id:
-				if matched is None:
+				if not force and matched is None:
 					matched = await _locator_has_match(locator)
 				if (not matched or force) and await _js_click_ref(page, ref_id):
 					pass
