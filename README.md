@@ -98,6 +98,8 @@ uv run pytest tests/ -x
 
 `bin/stealth_browser.py` is the canonical source; `bin/stealth-browser` is a symlink that preserves the historical path and PEP 723 `uv run --script` workflow. Dependencies are declared in both the script's PEP 723 block and `pyproject.toml`, and a test keeps them in sync.
 
+To publish a new version, see [RELEASING.md](RELEASING.md). Only a `v*` tag publishes; merging PRs does not.
+
 # Agent Skills (`skills/`)
 
 Reusable agent workflows live in [`skills/`](skills/), one directory per skill with a `SKILL.md`:
