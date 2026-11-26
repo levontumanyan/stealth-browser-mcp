@@ -1,8 +1,10 @@
 import collections
+import datetime
 import importlib.machinery
 import importlib.util
 import json
 import re
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -440,12 +442,13 @@ class TestInputCharTracking:
 def agy_env(tmp_path, monkeypatch):
 	monkeypatch.setattr(sba, "BRAIN_DIR", tmp_path)
 	monkeypatch.setattr(sba, "SUMMARY_DB", tmp_path / "missing.db")
+	monkeypatch.setattr(sba, "CACHE_DIR", tmp_path / ".cache")
 	return tmp_path
 
 
 def _write_agy_session(root: Path, cid: str, compact_output: str, full_output: str, overflow_file: Path | None = None, schema_reads: int = 0) -> None:
 	log_dir = root / cid / ".system_generated" / "logs"
-	log_dir.mkdir(parents=True)
+	log_dir.mkdir(parents=True, exist_ok=True)
 	if overflow_file is not None:
 		overflow_file.parent.mkdir(parents=True, exist_ok=True)
 		overflow_file.write_text(full_output, encoding="utf-8")
@@ -565,3 +568,333 @@ class TestSnapshotSummary:
 		assert snap["summary"]["schema_reads_total"] == 5
 		assert snap["summary"]["schema_reads_per_session"] == 2.5
 		assert snap["summary"]["schema_reads_per_agy_session"] == 2.0
+
+
+class TestStripAgyHeaders:
+	def test_peels_headers_and_preserves_body(self):
+		raw = "Created At: 2026-11-20T10:00:05Z\nCompleted At: 2026-11-20T10:00:08Z\nline1\nCreated At: body-not-header\n"
+		body, created, completed = sba.strip_agy_headers(raw)
+		assert body == "line1\nCreated At: body-not-header"
+		assert created == datetime.datetime(2026, 11, 20, 10, 0, 5, tzinfo=datetime.timezone.utc)
+		assert completed == datetime.datetime(2026, 11, 20, 10, 0, 8, tzinfo=datetime.timezone.utc)
+
+	def test_no_headers_and_crlf(self):
+		body, created, completed = sba.strip_agy_headers("  hello\r\nworld  ")
+		assert body == "hello\nworld"
+		assert created is None and completed is None
+		assert sba.strip_agy_headers("") == ("", None, None)
+
+
+class TestLoadAgyTitles:
+	def test_prefers_conversation_summaries_over_fts(self, tmp_path, monkeypatch):
+		db = tmp_path / "summaries.db"
+		conn = sqlite3.connect(db)
+		conn.execute("CREATE TABLE conversation_summaries (conversation_id TEXT, title TEXT)")
+		conn.execute("CREATE TABLE conversations_fts (conversation_id TEXT, title TEXT)")
+		conn.execute("INSERT INTO conversation_summaries VALUES ('c1', 'Primary Title')")
+		conn.execute("INSERT INTO conversations_fts VALUES ('c1', 'Stale FTS Title')")
+		conn.execute("INSERT INTO conversations_fts VALUES ('c2', 'FTS Only')")
+		conn.commit()
+		conn.close()
+		monkeypatch.setattr(sba, "SUMMARY_DB", db)
+		titles = sba.load_agy_titles()
+		assert titles == {"c1": "Primary Title", "c2": "FTS Only"}
+
+
+class TestAgyFastPaths:
+	def test_selective_line_parsing_and_auth_re(self, agy_env):
+		log_dir = agy_env / "cid-fast-1" / ".system_generated" / "logs"
+		log_dir.mkdir(parents=True)
+		lines = [
+			"not valid json at all",
+			json.dumps({"type": "USER", "content": "Please help with 2FA login"}),
+			json.dumps({"tool_calls": [{"name": "run_command", "args": {"CommandLine": "ls"}}]}),
+			json.dumps({"type": "GENERIC", "content": "Created At: 2026-11-20T09:58:00Z\nfile1\nfile2"}),
+			json.dumps({"type": "PLANNER_RESPONSE", "content": "ok"}),
+			json.dumps({"tool_calls": [
+				{"name": "run_command", "args": {"CommandLine": "echo hi"}},
+				{"name": "call_mcp_tool", "args": {"ServerName": "stealth-browser", "ToolName": "navigate", "Arguments": {"url": "https://example.com"}}},
+			]}),
+			json.dumps({"type": "GENERIC", "content": "Created At: 2026-11-20T10:00:00Z\nignored"}),
+			json.dumps({"type": "GENERIC", "content": "Created At: 2026-11-20T10:00:01Z\nCompleted At: 2026-11-20T10:00:03Z\nNavigated"}),
+			json.dumps({"type": "PLANNER_RESPONSE", "content": "done"}),
+		]
+		(log_dir / "transcript.jsonl").write_text("\n".join(lines), encoding="utf-8")
+
+		zero_dir = agy_env / "cid-fast-0" / ".system_generated" / "logs"
+		zero_dir.mkdir(parents=True)
+		(zero_dir / "transcript.jsonl").write_text(
+			json.dumps({"type": "USER", "content": "stealth-browser login captcha"}) + "\n",
+			encoding="utf-8",
+		)
+
+		collector = sba.AuditCollector(since=None, includes=[], excludes=[], slow_threshold=20.0, max_samples=2)
+		collector.collect_agy()
+		assert len(collector.sessions) == 1
+		assert collector.sessions[0]["sid"] == "cid-fast-1"
+		assert collector.tool_counts["navigate"] == 1
+		assert collector.auth_sessions == 1
+		assert collector.call_latencies["navigate"] == [2.0]
+
+	def test_parallel_path_deterministic_over_16_sessions(self, agy_env):
+		for idx in range(18):
+			_write_agy_session(agy_env, f"cid-par-{idx:02d}", "out", f"full-{idx}")
+		c1 = sba.AuditCollector(since=None, includes=[], excludes=[], slow_threshold=20.0, max_samples=2)
+		c1.collect_agy()
+		c2 = sba.AuditCollector(since=None, includes=[], excludes=[], slow_threshold=20.0, max_samples=2)
+		c2.collect_agy()
+		assert len(c1.sessions) == 18
+		assert [s["sid"] for s in c1.sessions] == [s["sid"] for s in c2.sessions]
+		assert [r["session_id"] for r in c1.call_records] == [r["session_id"] for r in c2.call_records]
+
+
+class TestOpencodeSqlPushdown:
+	def _make_db(self, db_path: Path) -> None:
+		conn = sqlite3.connect(db_path)
+		conn.execute("CREATE TABLE session_v2 (id TEXT PRIMARY KEY, title TEXT)")
+		conn.execute("CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT)")
+		conn.execute("CREATE INDEX idx_sm_sess ON session_message(session_id)")
+		conn.execute("CREATE INDEX idx_sm_time ON session_message(time_created)")
+		conn.executemany(
+			"INSERT INTO session_v2 VALUES (?, ?)",
+			[("ses_aaa1", "Alpha"), ("ses_bbb2", "Beta"), ("ses_old3", "Old")],
+		)
+		now_ms = int(datetime.datetime(2026, 11, 20, 12, 0, tzinfo=datetime.timezone.utc).timestamp() * 1000)
+		old_ms = int(datetime.datetime(2026, 10, 1, 12, 0, tzinfo=datetime.timezone.utc).timestamp() * 1000)
+
+		def msg_payload(call_id: str, ts_ms: int) -> str:
+			return json.dumps({
+				"content": [
+					{"type": "tool_use", "id": f"{call_id}-other", "name": "grep", "input": {"pattern": "x"}},
+					{
+						"type": "tool_use",
+						"id": call_id,
+						"name": "stealth-browser_navigate",
+						"input": {"url": "https://example.com"},
+						"state": {"status": "completed", "output": "Navigated", "time": {"start": ts_ms, "end": ts_ms + 1500}},
+					},
+				]
+			})
+
+		conn.executemany(
+			"INSERT INTO session_message VALUES (?, ?, ?, ?)",
+			[
+				("m1", "ses_aaa1", now_ms, msg_payload("c1", now_ms)),
+				("m2", "ses_bbb2", now_ms, msg_payload("c2", now_ms)),
+				("m3", "ses_old3", old_ms, msg_payload("c3", old_ms)),
+			],
+		)
+		conn.commit()
+		conn.close()
+
+	def test_includes_and_since_sql_pushdown(self, tmp_path, monkeypatch):
+		self._make_db(tmp_path / "opencode.db")
+		monkeypatch.setattr(sba, "OPENCODE_DIR", tmp_path)
+
+		c_inc = sba.AuditCollector(since=None, includes=["ses_aaa"], excludes=[], slow_threshold=20.0, max_samples=2)
+		c_inc.collect_opencode()
+		assert [s["sid"] for s in c_inc.sessions] == ["ses_aaa1"]
+		assert c_inc.tool_counts["navigate"] == 1
+
+		since = datetime.datetime(2026, 11, 1, 0, 0, tzinfo=datetime.timezone.utc)
+		c_since = sba.AuditCollector(since=since, includes=[], excludes=[], slow_threshold=20.0, max_samples=2)
+		c_since.collect_opencode()
+		assert sorted(s["sid"] for s in c_since.sessions) == ["ses_aaa1", "ses_bbb2"]
+		assert c_since.tool_counts["navigate"] == 2
+
+
+class TestSessionCache:
+	def test_agy_cache_hit_and_invalidation_on_mtime_size(self, agy_env, monkeypatch):
+		_write_agy_session(agy_env, "cid-cache-1", "compact", "F" * 100)
+		cache_dir = agy_env / ".cache"
+
+		c1 = sba.AuditCollector(since=None, includes=[], excludes=[], slow_threshold=20.0, max_samples=2, cache_dir=cache_dir)
+		c1.collect_agy()
+		assert c1.sessions[0]["chars"] == 100
+		assert (cache_dir / f"cache-v{sba.CACHE_SCHEMA_VERSION}.sqlite").exists()
+
+		called = []
+		orig_parse = sba._parse_agy_file
+
+		def spy_parse(*args, **kwargs):
+			called.append(args[0])
+			return orig_parse(*args, **kwargs)
+
+		monkeypatch.setattr(sba, "_parse_agy_file", spy_parse)
+		c2 = sba.AuditCollector(since=None, includes=[], excludes=[], slow_threshold=20.0, max_samples=2, cache_dir=cache_dir)
+		c2.collect_agy()
+		assert called == []
+		assert c2.sessions[0]["chars"] == 100
+		assert c2.call_records == c1.call_records
+
+		_write_agy_session(agy_env, "cid-cache-1", "compact", "G" * 250)
+		c3 = sba.AuditCollector(since=None, includes=[], excludes=[], slow_threshold=20.0, max_samples=2, cache_dir=cache_dir)
+		c3.collect_agy()
+		assert called == ["cid-cache-1"]
+		assert c3.sessions[0]["chars"] == 250
+
+	def test_opencode_cache_hit_and_time_updated_invalidation(self, tmp_path, monkeypatch):
+		db_path = tmp_path / "opencode.db"
+		conn = sqlite3.connect(db_path)
+		conn.execute("CREATE TABLE session_v2 (id TEXT PRIMARY KEY, title TEXT, time_updated INTEGER)")
+		conn.execute("CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT)")
+		ts1 = int(datetime.datetime(2026, 11, 20, 12, 0, tzinfo=datetime.timezone.utc).timestamp() * 1000)
+		msg1 = json.dumps({
+			"content": [{
+				"type": "tool_use",
+				"id": "call-1",
+				"name": "stealth-browser_navigate",
+				"input": {"url": "https://example.com"},
+				"state": {"status": "completed", "output": "Navigated", "time": {"start": ts1, "end": ts1 + 1000}},
+			}]
+		})
+		conn.execute("INSERT INTO session_v2 VALUES ('ses_c1', 'Cache Test', ?)", (ts1,))
+		conn.execute("INSERT INTO session_message VALUES ('m1', 'ses_c1', ?, ?)", (ts1, msg1))
+		conn.commit()
+		conn.close()
+
+		monkeypatch.setattr(sba, "OPENCODE_DIR", tmp_path)
+		cache_dir = tmp_path / ".cache"
+
+		c_uncached = sba.AuditCollector(since=None, includes=[], excludes=[], slow_threshold=20.0, max_samples=2, cache_dir=cache_dir, use_cache=False)
+		c_uncached.collect_opencode()
+
+		c1 = sba.AuditCollector(since=None, includes=[], excludes=[], slow_threshold=20.0, max_samples=2, cache_dir=cache_dir)
+		c1.collect_opencode()
+		c2 = sba.AuditCollector(since=None, includes=[], excludes=[], slow_threshold=20.0, max_samples=2, cache_dir=cache_dir)
+		c2.collect_opencode()
+
+		s_unc = c_uncached.build_snapshot(None, "opencode")
+		s_hit = c2.build_snapshot(None, "opencode")
+		s_unc.pop("generated_at")
+		s_hit.pop("generated_at")
+		assert s_hit == s_unc
+		assert c2.call_records == c_uncached.call_records
+
+		ts2 = ts1 + 5000
+		msg2 = json.dumps({
+			"content": [{
+				"type": "tool_use",
+				"id": "call-2",
+				"name": "stealth-browser_click",
+				"input": {"selector": "#btn"},
+				"state": {"status": "completed", "output": "Clicked", "time": {"start": ts2, "end": ts2 + 500}},
+			}]
+		})
+		conn = sqlite3.connect(db_path)
+		conn.execute("INSERT INTO session_message VALUES ('m2', 'ses_c1', ?, ?)", (ts2, msg2))
+		conn.execute("UPDATE session_v2 SET time_updated = ? WHERE id = 'ses_c1'", (ts2,))
+		conn.commit()
+		conn.close()
+
+		c3 = sba.AuditCollector(since=None, includes=[], excludes=[], slow_threshold=20.0, max_samples=2, cache_dir=cache_dir)
+		c3.collect_opencode()
+		assert c3.tool_counts["navigate"] == 1
+		assert c3.tool_counts["click"] == 1
+		assert len(c3.call_records) == 2
+
+	def test_schema_version_mismatch_invalidates_cache(self, agy_env, monkeypatch):
+		_write_agy_session(agy_env, "cid-ver-1", "compact", "V" * 80)
+		cache_dir = agy_env / ".cache"
+
+		c1 = sba.AuditCollector(since=None, includes=[], excludes=[], slow_threshold=20.0, max_samples=2, cache_dir=cache_dir)
+		c1.collect_agy()
+		db = cache_dir / f"cache-v{sba.CACHE_SCHEMA_VERSION}.sqlite"
+		conn = sqlite3.connect(db)
+		conn.execute("UPDATE meta SET value = '0' WHERE key = 'schema_version'")
+		conn.commit()
+		conn.close()
+
+		called = []
+		orig_parse = sba._parse_agy_file
+
+		def spy_parse(*args, **kwargs):
+			called.append(args[0])
+			return orig_parse(*args, **kwargs)
+
+		monkeypatch.setattr(sba, "_parse_agy_file", spy_parse)
+		c2 = sba.AuditCollector(since=None, includes=[], excludes=[], slow_threshold=20.0, max_samples=2, cache_dir=cache_dir)
+		c2.collect_agy()
+		assert called == ["cid-ver-1"]
+		assert c2.sessions[0]["chars"] == 80
+
+	def test_no_cache_and_unwritable_cache_dir_fallback(self, agy_env):
+		_write_agy_session(agy_env, "cid-fb-1", "compact", "U" * 60)
+		no_cache_dir = agy_env / "never_created"
+		c1 = sba.AuditCollector(since=None, includes=[], excludes=[], slow_threshold=20.0, max_samples=2, cache_dir=no_cache_dir, use_cache=False)
+		c1.collect_agy()
+		assert not no_cache_dir.exists()
+		assert c1.sessions[0]["chars"] == 60
+
+		blocker = agy_env / "not_a_dir"
+		blocker.write_text("file", encoding="utf-8")
+		c2 = sba.AuditCollector(since=None, includes=[], excludes=[], slow_threshold=20.0, max_samples=2, cache_dir=blocker, use_cache=True)
+		c2.collect_agy()
+		assert c2.sessions[0]["chars"] == 60
+
+	def test_orphan_row_pruning_on_unscoped_full_scans(self, agy_env, tmp_path, monkeypatch):
+		import shutil
+
+		_write_agy_session(agy_env, "cid-keep", "compact", "K" * 50)
+		_write_agy_session(agy_env, "cid-gone", "compact", "G" * 50)
+		cache_dir = agy_env / ".cache"
+
+		c1 = sba.AuditCollector(since=None, includes=[], excludes=[], slow_threshold=20.0, max_samples=2, cache_dir=cache_dir)
+		c1.collect_agy()
+		db_file = cache_dir / f"cache-v{sba.CACHE_SCHEMA_VERSION}.sqlite"
+
+		def _cached_ids(source: str) -> set[str]:
+			conn = sqlite3.connect(db_file)
+			try:
+				return {r[0] for r in conn.execute("SELECT session_id FROM sessions WHERE source = ?", (source,))}
+			finally:
+				conn.close()
+
+		assert _cached_ids("agy") == {"cid-keep", "cid-gone"}
+
+		shutil.rmtree(agy_env / "cid-gone")
+
+		c_scoped = sba.AuditCollector(since=None, includes=["cid-keep"], excludes=[], slow_threshold=20.0, max_samples=2, cache_dir=cache_dir)
+		c_scoped.collect_agy()
+		assert _cached_ids("agy") == {"cid-keep", "cid-gone"}
+
+		c_since = sba.AuditCollector(
+			since=datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc),
+			includes=[],
+			excludes=[],
+			slow_threshold=20.0,
+			max_samples=2,
+			cache_dir=cache_dir,
+		)
+		c_since.collect_agy()
+		assert _cached_ids("agy") == {"cid-keep", "cid-gone"}
+
+		c_full = sba.AuditCollector(since=None, includes=[], excludes=["cid-keep"], slow_threshold=20.0, max_samples=2, cache_dir=cache_dir)
+		c_full.collect_agy()
+		assert _cached_ids("agy") == {"cid-keep"}
+
+		oc_dir = tmp_path / "oc"
+		oc_dir.mkdir()
+		oc_db = oc_dir / "opencode.db"
+		ts1 = int(datetime.datetime(2026, 11, 20, 12, 0, tzinfo=datetime.timezone.utc).timestamp() * 1000)
+		conn = sqlite3.connect(oc_db)
+		conn.execute("CREATE TABLE session_v2 (id TEXT PRIMARY KEY, title TEXT, time_updated INTEGER)")
+		conn.execute("CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT)")
+		conn.execute("INSERT INTO session_v2 VALUES ('ses_keep', 'Keep', ?)", (ts1,))
+		conn.execute("INSERT INTO session_v2 VALUES ('ses_gone', 'Gone', ?)", (ts1,))
+		conn.commit()
+		conn.close()
+
+		monkeypatch.setattr(sba, "OPENCODE_DIR", oc_dir)
+		oc1 = sba.AuditCollector(since=None, includes=[], excludes=[], slow_threshold=20.0, max_samples=2, cache_dir=cache_dir)
+		oc1.collect_opencode()
+		assert _cached_ids("opencode") == {"opencode.db:ses_keep", "opencode.db:ses_gone"}
+
+		conn = sqlite3.connect(oc_db)
+		conn.execute("DELETE FROM session_v2 WHERE id = 'ses_gone'")
+		conn.commit()
+		conn.close()
+
+		oc_full = sba.AuditCollector(since=None, includes=[], excludes=["ses_keep"], slow_threshold=20.0, max_samples=2, cache_dir=cache_dir)
+		oc_full.collect_opencode()
+		assert _cached_ids("opencode") == {"opencode.db:ses_keep"}

@@ -19,6 +19,8 @@ Launching a second browser binary alongside an active one on macOS can corrupt s
 
 # Quickstart
 
+Review the [Trust model](#trust-model) for security and filesystem boundaries before exposing the server to untrusted prompts.
+
 Prerequisites:
 
 - **macOS** — the server uses `osascript` for human handoff and macOS-specific browser paths.
@@ -70,6 +72,15 @@ Or add the following to your agent's config (`~/.gemini/config/mcp_config.json`,
 
 `stealth-browser --doctor` checks Python, dependency versions, cheat-sheet creation, and browser/CDP availability, then exits non-zero on failure. Add `--smoke` to actually launch Chromium and open a tab. `stealth-browser --version` prints the installed version.
 
+## Shared Daemon & CLI
+
+By default, `stealth-browser` runs a lightweight stdlib stdio proxy that auto-starts and shares a single local daemon over a `0600` Unix Domain Socket (scoped per CDP port and profile). Multiple MCP clients and subagents share one browser instance with per-client tab isolation.
+
+- `stealth-browser --daemon-status` — print running daemon PID, socket/HTTP endpoints, active clients, and uptime.
+- `stealth-browser --daemon-stop` — stop the running shared daemon cleanly.
+- `stealth-browser --serve [--http [HOST:PORT]] [--daemon-idle-exit SECONDS]` — run the shared daemon directly; `--http` also enables loopback Streamable HTTP (default `127.0.0.1:9223`) with mandatory Bearer token auth; `--daemon-idle-exit` exits after idle seconds with 0 clients (`1800` default, `0` disables).
+- `stealth-browser --standalone` — run an isolated in-process stdio MCP server instead of proxying to the shared daemon.
+
 ## Available MCP Tools
 
 - `status`: Check connection status and list all open tabs with indices and stable ids.
@@ -84,9 +95,26 @@ Or add the following to your agent's config (`~/.gemini/config/mcp_config.json`,
 
 Headless by default; keep it that way and use `wait_for_human()` for interactive login/2FA/CAPTCHA.
 
+## Tool Gating (`--minimal` / `--disable-<section>`)
+
+Default exposes all 28 tools. To reduce schema context cost or restrict powerful tools per session (including over the shared daemon):
+
+- `stealth-browser --list-sections` — print all sections (`core`, `debug`, `network`, `lifecycle`), tool counts, and membership.
+- `stealth-browser --minimal` (or `STEALTH_BROWSER_MINIMAL=1`) — expose only the 16 `core` tools (`status` and `wait_for_human` are always protected in every mode).
+- `stealth-browser --disable-debug` / `--disable-network` / `--disable-lifecycle` (or `STEALTH_BROWSER_DISABLE_SECTIONS=debug,lifecycle`) — disable specific sections per session.
+
+# Trust model
+
+- **Transport & auth**: Default mode proxies stdio to a same-user `0600` Unix Domain Socket inside a `0700` runtime directory (`STEALTH_BROWSER_RUNTIME_DIR`, default `~/.cache/stealth-browser`). Optional `--serve --http [HOST:PORT]` binds loopback only, enforces a `Host` allowlist for DNS rebinding protection, and requires a `0600` Bearer token (`STEALTH_BROWSER_TOKEN_FILE`, default `~/.config/stealth-browser/daemon.token`). `--standalone` runs isolated in-process stdio with no socket or HTTP listener.
+- **Security principal**: Every connected agent is the security principal and can perform any action the user can perform in the attached browser (including all open tabs when attaching over CDP `127.0.0.1:9222`). The shared daemon shares browser state across connected sessions and guards destructive lifecycle calls (`close_browser`, `restart_browser`, `set_headless`) against sibling sessions unless `force=True` is passed.
+- **Filesystem boundaries**: `fetch(save_path=...)` and `screenshot(save_path=...)` write to any path writable by the OS user — treat paths originating from web content or untrusted prompts as untrusted. Browser downloads land in `STEALTH_BROWSER_DOWNLOADS_DIR` (`~/Downloads`), the profile lives in `STEALTH_BROWSER_PROFILE_DIR` (`~/.agent-chromium-profile`), and the optional Apple Passwords CRX extension is fetched from Google's CRX endpoint and verified before loading into the profile.
+- **Network & credentials**: In-browser `fetch` sends `credentials: 'include'` with the current origin's cookies and `evaluate_js` reads arbitrary page state. Stealth masking reduces automation fingerprinting; it is not anonymity and does not isolate credentials.
+- **Operator config & recovery**: `STEALTH_BROWSER_*` environment variables and MCP client configs are trusted host input; store secrets in macOS Keychain rather than configs or prompts. Recover from wedged or unwanted state via `close_browser(force=True)`, `restart_browser(force=True)`, `stealth-browser --daemon-stop`, or terminating the detached Chromium process; closing the last open tab with `close_tab` also closes the browser.
+- **Explicit non-claims**: No guarantee against bot detection; no proxy or anonymity features; detection depends on site policy, IP reputation, and browser build.
+
 # Audit
 
-- `stealth-browser-audit [--since 14d] [--session <sid-prefix>] [--diff <baseline.json>]` — mine local AGY and OpenCode transcripts for stealth-browser usage, error rates, latency, and workarounds; produces a prioritized improvement plan or before/after scorecard. The audit CLI lives in the repo checkout (`bin/stealth-browser-audit`) and is not part of the installed `stealthmcp` tool.
+- `stealth-browser-audit [--since 14d] [--session <sid-prefix>] [--diff <baseline.json>] [--no-cache]` — mine local AGY and OpenCode transcripts for stealth-browser usage, error rates, latency, and workarounds; produces a prioritized improvement plan or before/after scorecard. Installed alongside `stealth-browser` by `stealthmcp` and also runnable directly from a checkout via `bin/stealth-browser-audit`.
 
 # Development
 

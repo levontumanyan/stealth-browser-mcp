@@ -17,7 +17,7 @@ Launch a subagent via `invoke_subagent` (`TypeName: "self"`, `Role: "Browser Sub
 Give the subagent a self-contained brief specifying:
 - Target URL(s) and exact data, actions, or file downloads required.
 - Required return format (compact JSON, Markdown table, or saved file paths — no raw DOM/HTML dumps).
-- Tab-isolation contract: open an owned tab, pin every call to its `tab_id`, leave sibling tabs untouched, and close the owned tab before replying.
+- Tab-isolation contract: open an owned tab, pin every call to its `tab_id`, leave sibling tabs untouched, and close only the owned tab (`close_tab(tab="tN")`) before replying. Under the shared daemon, subagents must never call `close_browser` (or `restart_browser` / `set_headless` unless explicitly asked).
 - Human-handoff rule: invoke `wait_for_human` on any login, 2FA, or CAPTCHA gate.
 
 ## Subagent Execution Workflow
@@ -31,7 +31,7 @@ Give the subagent a self-contained brief specifying:
    - Keep Chromium headless by default; call `set_headless(headless=False)` only when explicitly asked.
    - If login, 2FA, or CAPTCHA blocks progress, call `wait_for_human(reason="<action needed>", url_contains="<post-auth path>", tab="tN")` (or `selector=...` / `url_not_contains=...`). It switches to headed mode with Apple Passwords, notifies the user, and resumes once the condition matches.
 4. **Prefer structured, compact, low-roundtrip tools**:
-   - `extract(container_selector=..., fields={...}, tab="tN")` for repeated cards, listings, or table rows.
+   - `extract(container_selector=..., fields={...}, tab="tN")` for repeated cards, listings, table rows, or reading form input values (`fields={"price": "@value #priceInput"}`) instead of `evaluate_js`.
    - `state(tab="tN")` for Next.js, Nuxt, Redux, React Fiber, Vue, Apollo, or React Query in-memory stores.
    - `snapshot(tab="tN")` (with optional `filter="..."` and/or `viewport_only=True` to narrow interactive refs `e0`, `e1`), followed by `batch(actions=[...], tab="tN")` for multi-step clicks/fills.
    - `get_content(tab="tN")` (with optional `filter="..."` and/or `offset=...` for filtered or paginated text reads instead of dumping full pages).
@@ -39,5 +39,5 @@ Give the subagent a self-contained brief specifying:
    - `evaluate_js(expression=..., tab="tN")` for targeted DOM reads; pass `main_world=True` only for custom page-world globals not covered by `state()`.
    - `wait_for(selector=..., text=..., url_contains=..., tab="tN")` instead of JS polling loops.
 5. **Clean up and report concisely**:
-   - Call `close_tab(tab="tN")` when finished (skip only if the user explicitly asked to keep the tab open).
+   - Call `close_tab(tab="tN")` when finished (skip only if the user explicitly asked to keep the tab open). Never call `close_browser` (and avoid `restart_browser` or `set_headless` unless explicitly asked) — the shared daemon serves sibling agents and parent sessions.
    - Return only the distilled structured data, action confirmation, and any saved file paths.

@@ -30,9 +30,6 @@ def sb():
 
 @pytest.fixture(autouse=True)
 def reset_state(sb, monkeypatch):
-	sb._adblock_engine = None
-	sb._adblock_initialized = False
-	sb._adblock_load_task = None
 	sb.session._playwright = None
 	sb.session._browser = None
 	sb.session._context = None
@@ -201,68 +198,6 @@ def test_fastmcp_instructions_cheatsheet(sb):
 		assert token in instructions, f"Missing {token} in instructions"
 
 
-def test_adblock_warmup_nonblocking_and_offloaded(sb, monkeypatch):
-	main_tid = threading.get_ident()
-	worker_tids = []
-	calls = 0
-
-	fake_engine = MagicMock()
-	fake_engine.check_network_urls.return_value = MagicMock(matched=True)
-
-	def slow_build():
-		nonlocal calls
-		calls += 1
-		worker_tids.append(threading.get_ident())
-		time.sleep(0.15)
-		return fake_engine
-
-	monkeypatch.setattr(sb, "_load_or_build_engine", slow_build)
-
-	async def scenario():
-		frame = MagicMock()
-		frame.url = "https://example.com"
-		frame.page = FakePage()
-		route1 = FakeRoute()
-		route2 = FakeRoute()
-		req = FakeRequest(url="https://tracker.example/pixel.js", frame=frame)
-
-		t0 = time.perf_counter()
-		await sb._network_route_handler(route1, req)
-		await sb._network_route_handler(route2, req)
-		elapsed = time.perf_counter() - t0
-
-		assert elapsed < 0.08
-		assert route1.continued == 1
-		assert route2.continued == 1
-		assert sb._adblock_load_task is not None
-
-		await sb._adblock_load_task
-		assert calls == 1
-		assert worker_tids == [worker_tids[0]]
-		assert worker_tids[0] != main_tid
-		assert sb._adblock_initialized is True
-
-		route3 = FakeRoute()
-		await sb._network_route_handler(route3, req)
-		assert route3.aborted == 1
-
-	asyncio.run(scenario())
-
-
-def test_network_route_handler_service_worker_passthrough(sb):
-	async def scenario():
-		route = FakeRoute()
-		req = FakeRequest(
-			url="https://example.com/sw-fetch",
-			frame_error=RuntimeError("Service Worker requests do not have an associated frame"),
-		)
-		await sb._network_route_handler(route, req)
-		assert route.continued == 1
-		assert route.aborted == 0
-
-	asyncio.run(scenario())
-
-
 def test_detect_cdp_headless_offloaded_to_thread(sb, monkeypatch):
 	main_tid = threading.get_ident()
 	detect_tids = []
@@ -283,7 +218,6 @@ def test_detect_cdp_headless_offloaded_to_thread(sb, monkeypatch):
 
 	sb.session._playwright = fake_pw
 	monkeypatch.setattr(sb.session, "_detect_cdp_headless", fake_detect)
-	monkeypatch.setattr(sb, "_adblock_initialized", True)
 
 	async def scenario():
 		ctx = await sb.session._connect_cdp()
@@ -836,98 +770,6 @@ def test_mcp_tool_call_unknown_param_error_names_offender(sb):
 			raise AssertionError("expected validation error")
 		except Exception as exc:
 			assert "tab_index" in str(exc), str(exc)
-
-	asyncio.run(scenario())
-
-
-def test_network_route_handler_document_policy(sb, monkeypatch):
-	class TrackingEngine:
-		def __init__(self, matched: bool):
-			self.matched = matched
-			self.calls = []
-
-		def check_network_urls(self, url, frame_url, res_type):
-			self.calls.append((url, frame_url, res_type))
-			result = MagicMock()
-			result.matched = self.matched
-			return result
-
-	async def scenario():
-		engine = TrackingEngine(matched=True)
-		monkeypatch.setattr(sb, "get_adblock_engine", lambda: engine)
-
-		subframe = MagicMock()
-		subframe.url = "https://old.example/widget"
-		subframe.parent_frame = MagicMock()
-		subframe.page = FakePage()
-		main_frame = MagicMock()
-		main_frame.url = "https://site.example"
-		main_frame.parent_frame = None
-		main_frame.page = FakePage()
-		fresh_frame = MagicMock()
-		fresh_frame.url = "about:blank"
-		fresh_frame.parent_frame = MagicMock()
-		fresh_frame.page = FakePage()
-
-		route = FakeRoute()
-		req = FakeRequest(url="https://ads.example/iframe.html", resource_type="document", frame=subframe)
-		await sb._network_route_handler(route, req)
-		assert route.aborted == 1
-		assert route.continued == 0
-		assert engine.calls[-1] == ("https://ads.example/iframe.html", "https://old.example/widget", "document")
-
-		route = FakeRoute()
-		req = FakeRequest(url="https://site.example/page2", resource_type="document", frame=main_frame)
-		await sb._network_route_handler(route, req)
-		assert route.continued == 1
-		assert route.aborted == 0
-
-		route = FakeRoute()
-		req = FakeRequest(url="https://site.example/first", resource_type="document", frame=fresh_frame)
-		await sb._network_route_handler(route, req)
-		assert route.continued == 1
-		assert route.aborted == 0
-
-		uncommitted_subframe = MagicMock()
-		uncommitted_subframe.url = "about:blank"
-		uncommitted_subframe.parent_frame = MagicMock()
-		uncommitted_subframe.page = FakePage()
-		route = FakeRoute()
-		req = FakeRequest(url="https://ads.example/late.html", resource_type="document", frame=uncommitted_subframe)
-		await sb._network_route_handler(route, req)
-		assert route.continued == 1
-		assert route.aborted == 0
-
-		engine_ok = TrackingEngine(matched=False)
-		monkeypatch.setattr(sb, "get_adblock_engine", lambda: engine_ok)
-		route = FakeRoute()
-		req = FakeRequest(url="https://ok.example/frame.html", resource_type="document", frame=subframe)
-		await sb._network_route_handler(route, req)
-		assert route.continued == 1
-		assert route.aborted == 0
-		assert engine_ok.calls[-1][2] == "document"
-
-	asyncio.run(scenario())
-
-
-def test_network_route_handler_document_policy_parent_frame_absent(sb, monkeypatch):
-	class TrackingEngine:
-		def check_network_urls(self, url, frame_url, res_type):
-			result = MagicMock()
-			result.matched = True
-			return result
-
-	async def scenario():
-		engine = TrackingEngine()
-		monkeypatch.setattr(sb, "get_adblock_engine", lambda: engine)
-		frame = MagicMock(spec=[])
-		frame.url = "https://old.example"
-		frame.page = FakePage()
-		route = FakeRoute()
-		req = FakeRequest(url="https://x.example/doc.html", resource_type="document", frame=frame)
-		await sb._network_route_handler(route, req)
-		assert route.continued == 1
-		assert route.aborted == 0
 
 	asyncio.run(scenario())
 
