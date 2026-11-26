@@ -26,6 +26,105 @@ DAEMON_DEFAULT_IDLE_EXIT = 1800
 _HEAVY_CLI_FLAGS = frozenset({"--serve", "--standalone", "--install-browser", "--doctor", "--smoke"})
 _AF_UNIX_MAX_SAFE_BYTES = 100
 
+PROTECTED_TOOLS = frozenset({"status", "wait_for_human"})
+TOOL_SECTIONS: dict[str, tuple[str, ...]] = {
+	"core": (
+		"status",
+		"wait_for_human",
+		"new_tab",
+		"navigate",
+		"switch_tab",
+		"close_tab",
+		"snapshot",
+		"get_content",
+		"extract",
+		"click",
+		"type",
+		"press_key",
+		"scroll",
+		"wait_for",
+		"screenshot",
+		"batch",
+	),
+	"debug": ("evaluate_js", "state"),
+	"network": ("fetch", "downloads", "network_requests", "console_logs"),
+	"lifecycle": (
+		"close_browser",
+		"restart_browser",
+		"set_headless",
+		"set_media",
+		"set_animations",
+		"keep_alive",
+	),
+}
+_DISABLEABLE_SECTIONS = ("debug", "network", "lifecycle")
+
+
+def _resolve_disabled_tools(
+	minimal: bool = False,
+	disabled_sections: Optional[list[str]] = None,
+	env: Optional[dict[str, str]] = None,
+) -> tuple[frozenset[str], tuple[str, ...], bool]:
+	src_env = os.environ if env is None else env
+	env_minimal = src_env.get("STEALTH_BROWSER_MINIMAL", "").strip().lower() in ("1", "true", "yes")
+	effective_minimal = bool(minimal or env_minimal)
+	requested: list[str] = []
+	if effective_minimal:
+		requested.extend(_DISABLEABLE_SECTIONS)
+	if disabled_sections:
+		requested.extend(disabled_sections)
+	raw_env_sections = src_env.get("STEALTH_BROWSER_DISABLE_SECTIONS", "")
+	if raw_env_sections.strip():
+		for part in raw_env_sections.split(","):
+			sec = part.strip().lower()
+			if sec:
+				requested.append(sec)
+	ordered: list[str] = []
+	seen: set[str] = set()
+	for sec in requested:
+		key = sec.strip().lower()
+		if not key:
+			continue
+		if key not in TOOL_SECTIONS:
+			valid = ", ".join(TOOL_SECTIONS.keys())
+			raise ValueError(f"Unknown tool section {sec!r}; valid sections: {valid}")
+		if key not in seen:
+			seen.add(key)
+			ordered.append(key)
+	disabled: set[str] = set()
+	for sec in ordered:
+		disabled.update(TOOL_SECTIONS[sec])
+	disabled.difference_update(PROTECTED_TOOLS)
+	return frozenset(disabled), tuple(ordered), effective_minimal
+
+
+def _gating_notice(minimal: bool, disabled_sections: tuple[str, ...], disabled_tools: frozenset[str]) -> str:
+	if not disabled_tools:
+		return ""
+	total = sum(len(v) for v in TOOL_SECTIONS.values())
+	enabled = total - len(disabled_tools)
+	if minimal and set(disabled_sections) == set(_DISABLEABLE_SECTIONS):
+		return f"[Tool gating active: --minimal ({enabled} core tools enabled); disabled sections: {', '.join(disabled_sections)}]"
+	return f"[Tool gating active: {enabled}/{total} tools enabled; disabled sections: {', '.join(disabled_sections)}]"
+
+
+def _format_sections_list() -> str:
+	total = sum(len(v) for v in TOOL_SECTIONS.values())
+	lines = [f"stealth-browser tool sections ({total} tools total; protected in all modes: {', '.join(sorted(PROTECTED_TOOLS))}):"]
+	for name, tools in TOOL_SECTIONS.items():
+		lines.append(f"  {name} ({len(tools)}): {', '.join(tools)}")
+	return "\n".join(lines)
+
+
+def _disabled_sections_from_args(args: argparse.Namespace) -> list[str]:
+	out: list[str] = []
+	for sec in _DISABLEABLE_SECTIONS:
+		if getattr(args, f"disable_{sec}", False):
+			out.append(sec)
+	if getattr(args, "disable_core", False):
+		out.append("core")
+	return out
+
 
 def _build_arg_parser() -> argparse.ArgumentParser:
 	parser = argparse.ArgumentParser(
@@ -55,6 +154,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 	parser.add_argument("--daemon-status", action="store_true", help="Print shared daemon status and exit")
 	parser.add_argument("--daemon-stop", action="store_true", help="Stop the running shared daemon cleanly and exit")
 	parser.add_argument("--standalone", action="store_true", help="Run direct in-process stdio MCP server instead of proxying to the shared daemon")
+	parser.add_argument("--list-sections", action="store_true", help="Print tool section names, counts, and membership and exit")
+	parser.add_argument("--minimal", action="store_true", help="Expose only the 16 core interaction tools (also via STEALTH_BROWSER_MINIMAL=1)")
+	parser.add_argument("--disable-debug", action="store_true", help="Disable debug tools (evaluate_js, state)")
+	parser.add_argument("--disable-network", action="store_true", help="Disable network tools (fetch, downloads, network_requests, console_logs)")
+	parser.add_argument("--disable-lifecycle", action="store_true", help="Disable lifecycle tools (close_browser, restart_browser, set_headless, set_media, set_animations, keep_alive)")
+	parser.add_argument("--disable-core", action="store_true", help="Disable non-protected core tools (status and wait_for_human always remain enabled)")
 	return parser
 
 
@@ -305,6 +410,8 @@ def _ensure_daemon_running(
 				str(idle_exit_s),
 			]
 			env = os.environ.copy()
+			env.pop("STEALTH_BROWSER_MINIMAL", None)
+			env.pop("STEALTH_BROWSER_DISABLE_SECTIONS", None)
 			if runtime_dir is not None:
 				env["STEALTH_BROWSER_RUNTIME_DIR"] = rdir
 			if cdp_port is not None:
@@ -361,17 +468,53 @@ class _StdioUdsProxy:
 		out_stream=None,
 		request_timeout: float = 300.0,
 		reconnect_fn=None,
+		disabled_tools: frozenset[str] = frozenset(),
+		gating_notice: str = "",
 	):
 		self.sock_path = sock_path
 		self.in_stream = in_stream if in_stream is not None else sys.stdin.buffer
 		self.out_stream = out_stream if out_stream is not None else sys.stdout.buffer
 		self.request_timeout = request_timeout
 		self.reconnect_fn = reconnect_fn
+		self.disabled_tools = frozenset(disabled_tools) - PROTECTED_TOOLS
+		self.gating_notice = gating_notice
 		self.session_id: Optional[str] = None
 		self._write_lock = threading.Lock()
 		self._state_lock = threading.Lock()
 		self._init_raw: Optional[bytes] = None
 		self._initialized_raw: Optional[bytes] = None
+
+	def _filter_response_payload(self, payload: bytes, method: str) -> bytes:
+		if not self.disabled_tools or method not in ("tools/list", "initialize"):
+			return payload
+		try:
+			obj = json.loads(payload.decode("utf-8"))
+		except Exception:
+			return payload
+		if not isinstance(obj, dict):
+			return payload
+		result = obj.get("result")
+		if not isinstance(result, dict):
+			return payload
+		changed = False
+		if method == "tools/list" and isinstance(result.get("tools"), list):
+			result["tools"] = [
+				t for t in result["tools"]
+				if not (isinstance(t, dict) and t.get("name") in self.disabled_tools)
+			]
+			changed = True
+		elif method == "initialize" and self.gating_notice:
+			existing = result.get("instructions")
+			if isinstance(existing, str) and existing:
+				if self.gating_notice not in existing:
+					result["instructions"] = f"{existing}\n{self.gating_notice}"
+					changed = True
+			else:
+				result["instructions"] = self.gating_notice
+				changed = True
+		if not changed:
+			return payload
+		return json.dumps(obj).encode("utf-8")
 
 	def _write_line(self, payload: bytes) -> None:
 		line = payload.rstrip(b"\r\n") + b"\n"
@@ -426,6 +569,22 @@ class _StdioUdsProxy:
 				return False
 
 	def _forward_message(self, raw: bytes, method: str, msg_id: Any, parsed: Any = None) -> None:
+		if self.disabled_tools and method == "tools/call" and isinstance(parsed, dict):
+			params = parsed.get("params")
+			tool_name = params.get("name", "") if isinstance(params, dict) else ""
+			if tool_name in self.disabled_tools:
+				if msg_id is not None:
+					err = json.dumps({
+						"jsonrpc": "2.0",
+						"id": msg_id,
+						"error": {
+							"code": -32602,
+							"message": f"Tool '{tool_name}' is disabled in this session",
+						},
+					}).encode("utf-8")
+					self._write_line(err)
+				return
+
 		req_timeout = self._timeout_for_request(method, parsed)
 		try:
 			status_code, resp_headers, data = self._post_mcp(raw, self.session_id, timeout=req_timeout)
@@ -461,7 +620,7 @@ class _StdioUdsProxy:
 		payloads = _extract_mcp_payloads(resp_headers.get("content-type", ""), data)
 		if payloads:
 			for payload in payloads:
-				self._write_line(payload)
+				self._write_line(self._filter_response_payload(payload, method))
 		elif status_code >= 400:
 			msg = data.decode("utf-8", errors="replace").strip() or f"HTTP {status_code}"
 			err = json.dumps({"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32000, "message": msg}}).encode("utf-8")
@@ -538,12 +697,22 @@ def _run_daemon_stop(runtime_dir: Optional[str] = None) -> int:
 	return 1
 
 
-def _run_stdio_proxy(runtime_dir: Optional[str] = None, idle_exit_s: int = DAEMON_DEFAULT_IDLE_EXIT) -> int:
+def _run_stdio_proxy(
+	runtime_dir: Optional[str] = None,
+	idle_exit_s: int = DAEMON_DEFAULT_IDLE_EXIT,
+	disabled_tools: frozenset[str] = frozenset(),
+	gating_notice: str = "",
+) -> int:
 	def _ensure():
 		return _ensure_daemon_running(runtime_dir=runtime_dir, idle_exit_s=idle_exit_s)
 
 	sock_path = _ensure()
-	proxy = _StdioUdsProxy(sock_path, reconnect_fn=_ensure)
+	proxy = _StdioUdsProxy(
+		sock_path,
+		reconnect_fn=_ensure,
+		disabled_tools=disabled_tools,
+		gating_notice=gating_notice,
+	)
 	return proxy.run()
 
 
@@ -554,10 +723,22 @@ def _is_cli_fast_path(argv: Optional[list[str]] = None) -> bool:
 
 def _run_cli_fast_path() -> int:
 	args = _build_arg_parser().parse_args()
+	if args.list_sections:
+		print(_format_sections_list())
+		return 0
 	if args.daemon_status:
 		return _run_daemon_status()
 	if args.daemon_stop:
 		return _run_daemon_stop()
+	try:
+		disabled_tools, disabled_sections, effective_minimal = _resolve_disabled_tools(
+			minimal=args.minimal,
+			disabled_sections=_disabled_sections_from_args(args),
+		)
+	except ValueError as exc:
+		print(f"Error: {exc}", file=sys.stderr)
+		return 2
+	notice = _gating_notice(effective_minimal, disabled_sections, disabled_tools)
 
 	def _handle_signal(_signum, _frame):
 		raise SystemExit(0)
@@ -565,7 +746,11 @@ def _run_cli_fast_path() -> int:
 	for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
 		signal.signal(sig, _handle_signal)
 	try:
-		return _run_stdio_proxy(idle_exit_s=args.daemon_idle_exit)
+		return _run_stdio_proxy(
+			idle_exit_s=args.daemon_idle_exit,
+			disabled_tools=disabled_tools,
+			gating_notice=notice,
+		)
 	except (KeyboardInterrupt, SystemExit):
 		return 0
 

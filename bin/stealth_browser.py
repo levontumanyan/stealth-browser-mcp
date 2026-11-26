@@ -37,18 +37,24 @@ from stealth_browser_cli import (
 	DAEMON_DEFAULT_HTTP,
 	DAEMON_DEFAULT_IDLE_EXIT,
 	PROFILE_DIR,
+	PROTECTED_TOOLS,
+	TOOL_SECTIONS,
 	_HEAVY_CLI_FLAGS,
 	_StdioUdsProxy,
 	_UnixHTTPConnection,
 	_build_arg_parser,
 	_daemon_paths,
+	_disabled_sections_from_args,
 	_ensure_daemon_running,
 	_ensure_daemon_token,
 	_ensure_secure_runtime_dir,
 	_extract_mcp_payloads,
+	_format_sections_list,
+	_gating_notice,
 	_is_cli_fast_path as _cli_is_fast_path,
 	_parse_loopback_http,
 	_probe_daemon_health,
+	_resolve_disabled_tools,
 	_run_cli_fast_path,
 	_run_daemon_status,
 	_run_daemon_stop,
@@ -5741,9 +5747,33 @@ def _serve_daemon(
 	return 0
 
 
+def _apply_tool_gating(
+	disabled_tools: frozenset[str],
+	gating_notice: str = "",
+	mcp_server: Optional[FastMCP] = None,
+) -> list[str]:
+	target = mcp if mcp_server is None else mcp_server
+	removed: list[str] = []
+	effective = frozenset(disabled_tools) - PROTECTED_TOOLS
+	for name in sorted(effective):
+		try:
+			target.remove_tool(name)
+			removed.append(name)
+		except Exception:
+			pass
+	if gating_notice:
+		existing = target._mcp_server.instructions or ""
+		if gating_notice not in existing:
+			target._mcp_server.instructions = f"{existing}\n{gating_notice}" if existing else gating_notice
+	return removed
+
+
 def main():
 	args = _build_arg_parser().parse_args()
 
+	if args.list_sections:
+		print(_format_sections_list())
+		raise SystemExit(0)
 	if args.install_browser:
 		raise SystemExit(_install_browser())
 	if args.doctor or args.smoke:
@@ -5752,10 +5782,32 @@ def main():
 		raise SystemExit(_run_daemon_status())
 	if args.daemon_stop:
 		raise SystemExit(_run_daemon_stop())
+
+	try:
+		disabled_tools, disabled_sections, effective_minimal = _resolve_disabled_tools(
+			minimal=args.minimal,
+			disabled_sections=_disabled_sections_from_args(args),
+		)
+	except ValueError as exc:
+		print(f"Error: {exc}", file=sys.stderr)
+		raise SystemExit(2)
+	notice = _gating_notice(effective_minimal, disabled_sections, disabled_tools)
+
 	if args.serve:
+		if disabled_tools:
+			_apply_tool_gating(disabled_tools, notice)
 		raise SystemExit(_serve_daemon(http_addr=args.http, idle_exit_s=args.daemon_idle_exit))
 	if not args.standalone:
-		raise SystemExit(_run_stdio_proxy(idle_exit_s=args.daemon_idle_exit))
+		raise SystemExit(
+			_run_stdio_proxy(
+				idle_exit_s=args.daemon_idle_exit,
+				disabled_tools=disabled_tools,
+				gating_notice=notice,
+			)
+		)
+
+	if disabled_tools:
+		_apply_tool_gating(disabled_tools, notice)
 
 	def _handle_signal(signum, _frame):
 		raise SystemExit(0)

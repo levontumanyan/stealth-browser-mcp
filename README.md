@@ -84,6 +84,14 @@ Or add the following to your agent's config (`~/.gemini/config/mcp_config.json`,
 
 Headless by default; keep it that way and use `wait_for_human()` for interactive login/2FA/CAPTCHA.
 
+## Tool Gating (`--minimal` / `--disable-<section>`)
+
+Default exposes all 28 tools. To reduce schema context cost or restrict powerful tools per session (including over the shared daemon):
+
+- `stealth-browser --list-sections` — print all sections (`core`, `debug`, `network`, `lifecycle`), tool counts, and membership.
+- `stealth-browser --minimal` (or `STEALTH_BROWSER_MINIMAL=1`) — expose only the 16 `core` tools (`status` and `wait_for_human` are always protected in every mode).
+- `stealth-browser --disable-debug` / `--disable-network` / `--disable-lifecycle` (or `STEALTH_BROWSER_DISABLE_SECTIONS=debug,lifecycle`) — disable specific sections per session.
+
 # Audit
 
 - `stealth-browser-audit [--since 14d] [--session <sid-prefix>] [--diff <baseline.json>]` — mine local AGY and OpenCode transcripts for stealth-browser usage, error rates, latency, and workarounds; produces a prioritized improvement plan or before/after scorecard. The audit CLI lives in the repo checkout (`bin/stealth-browser-audit`) and is not part of the installed `stealthmcp` tool.
