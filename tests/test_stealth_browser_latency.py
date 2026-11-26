@@ -352,3 +352,243 @@ def test_network_blocker_close_all_and_set_page_media_state(monkeypatch):
 		assert not blocker._media_enabled
 
 	asyncio.run(_run())
+
+
+def test_resolve_locator_text_parallel_preserves_role_priority_and_frame_order():
+	async def _run():
+		class DelayedLocator:
+			def __init__(self, count: int = 0, visible: bool = True, delay: float = 0.05):
+				self._count = count
+				self._visible = visible
+				self._delay = delay
+				self.first = self
+
+			async def count(self) -> int:
+				await asyncio.sleep(self._delay)
+				return self._count
+
+			async def is_visible(self) -> bool:
+				return self._visible
+
+		class Scope:
+			def __init__(self, roles=None, text_loc=None):
+				self._roles = roles or {}
+				self._text_loc = text_loc or DelayedLocator(count=0)
+				self.role_calls = 0
+
+			def get_by_role(self, role: str, name: str = ""):
+				self.role_calls += 1
+				return self._roles.get(role, DelayedLocator(count=0))
+
+			def get_by_text(self, text: str):
+				return self._text_loc
+
+		link_loc = DelayedLocator(count=1)
+		text_loc = DelayedLocator(count=1)
+		iframe_loc = DelayedLocator(count=1)
+		iframe = Scope(roles={"button": iframe_loc})
+		page = Scope(roles={"link": link_loc}, text_loc=text_loc)
+		page.main_frame = page
+		page.frames = [page, iframe]
+
+		t0 = time.perf_counter()
+		loc, _, _, matched = await sb._resolve_locator(page, text="Continue")
+		elapsed = time.perf_counter() - t0
+		assert matched is True
+		assert loc is link_loc
+		assert elapsed < 0.18, f"Expected parallel role lookup (<0.18s), got {elapsed:.3f}s"
+		assert iframe.role_calls == 0
+
+		page_empty = Scope()
+		iframe1 = Scope(roles={"menuitem": iframe_loc})
+		iframe2 = Scope(roles={"button": DelayedLocator(count=1)})
+		page_empty.main_frame = page_empty
+		page_empty.frames = [page_empty, iframe1, iframe2]
+		t1 = time.perf_counter()
+		loc2, _, _, matched2 = await sb._resolve_locator(page_empty, text="Continue")
+		elapsed2 = time.perf_counter() - t1
+		assert matched2 is True
+		assert loc2 is iframe_loc
+		assert elapsed2 < 0.25, f"Expected parallel secondary frame lookup (<0.25s), got {elapsed2:.3f}s"
+
+	asyncio.run(_run())
+
+
+def test_wait_for_text_uses_mutation_observer_and_retries_on_navigation(monkeypatch):
+	async def _run():
+		seen_scripts: list[str] = []
+		calls = 0
+
+		async def fake_eval(script, arg):
+			nonlocal calls
+			calls += 1
+			seen_scripts.append(script)
+			assert arg == "Order Confirmed"
+			if calls == 1:
+				raise RuntimeError("Page.evaluate: Execution context was destroyed")
+			return True
+
+		page = MagicMock()
+		page.url = "https://shop.example/done"
+		page.is_closed.return_value = False
+		page.evaluate = AsyncMock(side_effect=fake_eval)
+		monkeypatch.setattr(sb.session, "resolve_page", AsyncMock(return_value=page))
+
+		res = await sb.wait_for(text="Order Confirmed", timeout_ms=2000)
+		assert "Wait condition met (text='Order Confirmed')" in res
+		assert calls == 2
+		assert "MutationObserver" in seen_scripts[0]
+		assert "textContent" in seen_scripts[0]
+
+	asyncio.run(_run())
+
+
+def test_force_kill_skips_sleep_when_idle_and_restart_reopens_tabs_in_parallel(monkeypatch):
+	sleeps: list[float] = []
+	cmds: list[list[str]] = []
+
+	def fake_run_miss(cmd, **kwargs):
+		cmds.append(cmd)
+		res = MagicMock()
+		res.returncode = 1
+		return res
+
+	monkeypatch.setattr(sb.subprocess, "run", fake_run_miss)
+	monkeypatch.setattr(sb.time, "sleep", lambda s: sleeps.append(s))
+	sb._force_kill_browser_processes()
+	assert sleeps == []
+	assert len(cmds) == 2
+
+	cmds.clear()
+	sleeps.clear()
+
+	def fake_run_hit(cmd, **kwargs):
+		cmds.append(cmd)
+		res = MagicMock()
+		res.returncode = 0
+		return res
+
+	monkeypatch.setattr(sb.subprocess, "run", fake_run_hit)
+	sb._force_kill_browser_processes()
+	assert sleeps == [0.3]
+	assert len(cmds) == 4
+
+	async def _run_restart():
+		reopened_order: list[str] = []
+
+		class ReopenPage:
+			def __init__(self, url="about:blank"):
+				self.url = url
+
+			def is_closed(self):
+				return False
+
+			async def goto(self, target_url, **kwargs):
+				await asyncio.sleep(0.08)
+				self.url = target_url
+				reopened_order.append(target_url)
+
+			async def title(self):
+				return "Title"
+
+		initial_pages = [
+			ReopenPage("https://a.example"),
+			ReopenPage("https://b.example"),
+			ReopenPage("https://c.example"),
+			ReopenPage("https://d.example"),
+		]
+		created_pages: list[ReopenPage] = []
+
+		class FakeCtx:
+			async def new_page(self):
+				p = ReopenPage()
+				created_pages.append(p)
+				return p
+
+		mgr = sb.BrowserSessionManager("http://127.0.0.1:9222")
+		mgr.get_pages = AsyncMock(return_value=initial_pages)
+		mgr.get_active_page = AsyncMock(return_value=ReopenPage())
+		mgr.get_context = AsyncMock(return_value=FakeCtx())
+		monkeypatch.setattr(sb, "session", mgr)
+		monkeypatch.setattr(sb, "close_browser", AsyncMock(return_value="closed"))
+		monkeypatch.setattr(sb, "_save_persisted_headless", lambda _: None)
+		monkeypatch.setattr(sb, "_apply_animations_to_page", AsyncMock())
+		monkeypatch.setattr(sb.network_blocker, "ensure_page", AsyncMock())
+
+		t0 = time.perf_counter()
+		res = await sb._restart_browser_inner()
+		elapsed = time.perf_counter() - t0
+		assert "reopened 4 tab(s)" in res
+		assert len(created_pages) == 3
+		assert [p.url for p in created_pages] == ["https://b.example", "https://c.example", "https://d.example"]
+		assert elapsed < 0.65, f"Expected parallel extra tab reopen (<0.65s incl 0.3s+0.08s), got {elapsed:.3f}s"
+
+	asyncio.run(_run_restart())
+
+
+def test_new_tab_avoids_duplicate_get_pages_and_connect_cdp_parallelizes(monkeypatch):
+	async def _run():
+		page = MagicMock()
+		page.is_closed.return_value = False
+		mgr = sb.BrowserSessionManager("http://127.0.0.1:9222")
+		mgr._active_page = page
+		mgr.get_pages = AsyncMock(return_value=[page])
+		monkeypatch.setattr(sb, "session", mgr)
+		monkeypatch.setattr(sb, "navigate", AsyncMock(return_value="Navigated tab [0] to 'https://x.test' [HTTP 200]"))
+
+		out = await sb.new_tab("https://x.test")
+		assert "(tab_id=t1)" in out
+		mgr.get_pages.assert_not_awaited()
+
+		mgr2 = sb.BrowserSessionManager("http://127.0.0.1:9222")
+		fake_ctx = MagicMock()
+		fake_browser = MagicMock()
+		fake_browser.contexts = [fake_ctx]
+		mgr2._playwright = MagicMock()
+		mgr2._playwright.chromium.connect_over_cdp = AsyncMock(return_value=fake_browser)
+
+		def slow_detect():
+			time.sleep(0.06)
+			return False
+
+		async def slow_interceptor(ctx):
+			await asyncio.sleep(0.06)
+
+		mgr2._detect_cdp_headless = slow_detect
+		mgr2._ensure_interceptor = slow_interceptor
+		t0 = time.perf_counter()
+		ctx = await mgr2._connect_cdp()
+		elapsed = time.perf_counter() - t0
+		assert ctx is fake_ctx
+		assert mgr2.headless is False
+		assert elapsed < 0.11, f"Expected parallel _connect_cdp (<0.11s), got {elapsed:.3f}s"
+
+	asyncio.run(_run())
+
+
+def test_telemetry_tracker_defers_header_extraction_until_get_network():
+	tracker = sb.TelemetryTracker(maxlen=20)
+	page = MagicMock()
+	req = MagicMock()
+	req.method = "GET"
+	req.resource_type = "fetch"
+	req.url = "https://bank.example/statement.pdf"
+	req.timing = {"responseEnd": 42.4}
+	resp = MagicMock()
+	resp.request = req
+	resp.status = 200
+	resp.url = req.url
+	resp.headers = {"Content-Type": "application/pdf", "Content-Length": "4096"}
+
+	tracker._on_response(page, resp)
+	raw_entry = tracker._network[page][0]
+	assert "_raw_headers" in raw_entry
+	assert raw_entry["content_type"] == ""
+	assert raw_entry["size_bytes"] is None
+
+	items, total = tracker.get_network(page, content_type="pdf")
+	assert total == 1
+	assert len(items) == 1
+	assert items[0]["content_type"] == "application/pdf"
+	assert items[0]["size_bytes"] == 4096
+	assert "_raw_headers" not in items[0]
