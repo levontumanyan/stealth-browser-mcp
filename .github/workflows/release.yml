@@ -65,3 +65,23 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       - name: Publish to PyPI
         run: uv publish --trusted-publishing always dist/*
+
+  github-release:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" dist/* \
+            --title "$TAG — stealthmcp release" \
+            --generate-notes \
+            --verify-tag
