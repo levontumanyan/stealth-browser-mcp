@@ -4552,7 +4552,9 @@ def _doctor(smoke: bool = False) -> int:
 			checks.append(("CDP attach", False, str(exc)))
 	else:
 		async def _probe_executable():
-			async with async_playwright() as pw:
+			from patchright.async_api import async_playwright as _async_playwright
+
+			async with _async_playwright() as pw:
 				return pw.chromium.executable_path
 
 		try:
@@ -4571,13 +4573,14 @@ def _doctor(smoke: bool = False) -> int:
 		except Exception as exc:
 			checks.append(("Browser smoke test", False, str(exc)))
 
+	informational = {f"CDP endpoint ({CDP_URL})", "Browser executable"}
 	width = max(len(label) for label, _, _ in checks)
 	failures = 0
 	for label, ok, detail in checks:
 		status = "OK" if ok else "FAIL"
-		if not ok and label != f"CDP endpoint ({CDP_URL})":
+		if not ok and label not in informational:
 			failures += 1
-		if not ok and label == f"CDP endpoint ({CDP_URL})":
+		if not ok and label in informational:
 			status = "INFO"
 		print(f"[{status}] {label.ljust(width)}  {detail}")
 
