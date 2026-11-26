@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "stealthmcp"
+dynamic = ["version"]
+description = "Stealth browser automation MCP server for AI coding agents on macOS"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [
+	{name = "Levon Tumanyan"},
+]
+dependencies = [
+	"adblock==0.6.0",
+	"mcp==1.30.0",
+	"patchright==1.64.4",
+]
+
+[project.scripts]
+stealth-browser = "stealth_browser:main"
+
+[project.urls]
+Homepage = "https://github.com/levontumanyan/stealth-browser-mcp"
+Repository = "https://github.com/levontumanyan/stealth-browser-mcp"
+Issues = "https://github.com/levontumanyan/stealth-browser-mcp/issues"
+
+[dependency-groups]
+dev = [
+	"pytest>=7",
+]
+
+[tool.hatch.version]
+path = "bin/stealth_browser.py"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["bin/stealth_browser.py"]
+sources = ["bin"]

@@ -1,13 +1,13 @@
 # stealth-browser-mcp
 
+[![PyPI](https://img.shields.io/pypi/v/stealthmcp)](https://pypi.org/project/stealthmcp/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![tests](https://github.com/levontumanyan/stealth-browser-mcp/actions/workflows/tests.yml/badge.svg)](https://github.com/levontumanyan/stealth-browser-mcp/actions/workflows/tests.yml)
+![macOS](https://img.shields.io/badge/platform-macOS-lightgrey)
 ![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)
 ![uv](https://img.shields.io/badge/powered%20by-uv-%231284da)
 
 Stealth browser automation for AI coding agents on macOS — an MCP server (`stealth-browser`) and a transcript-driven audit CLI (`stealth-browser-audit`).
-
-Every tool in `bin/` is a self-contained PEP 723 `uv run --script` executable with auto-generated `--help`, zero global Python pollution, and instant startup.
 
 # Why stealth-browser?
 
@@ -19,32 +19,55 @@ Launching a second browser binary alongside an active one on macOS can corrupt s
 
 # Quickstart
 
+Prerequisites:
+
+- **macOS** — the server uses `osascript` for human handoff and macOS-specific browser paths.
+- **[uv](https://docs.astral.sh/uv/getting-started/installation/)** — install with `brew install uv` or the official installer. uv manages Python and dependencies; no system Python setup is needed.
+- A first-launch browser download (~195 MB network, ~370 MB on disk) via `stealth-browser --install-browser`.
+
+Install the tool and register it with your agent — no clone and no absolute path required:
+
 ```sh
-git clone https://github.com/levontumanyan/stealth-browser-mcp.git ~/repos/stealth-browser-mcp
-export PATH="$HOME/repos/stealth-browser-mcp/bin:$PATH"
-stealth-browser --help
+uv tool install stealthmcp
+stealth-browser --install-browser
+stealth-browser --doctor
 ```
+
+Upgrade or remove later with `uv tool upgrade stealthmcp` / `uv tool uninstall stealthmcp`.
+
+If `stealth-browser` is not found after install, run `uv tool update-shell` to add uv's tool directory (`~/.local/bin`) to your `PATH`. GUI-launched clients that ignore your shell `PATH` can use the full shim path printed by `uv tool dir` (for example `~/.local/bin/stealth-browser`).
 
 ## MCP Configuration
 
-Add to your agent's MCP configuration (`~/.gemini/config/mcp_config.json`, `~/.config/opencode/opencode.jsonc`, `~/.claude.json`, or `.cursor/mcp.json`):
+The install above provides a `stealth-browser` command on your `PATH`. The cleanest setup uses your client's CLI, which writes the config for you:
+
+```sh
+claude mcp add -s user stealth-browser -- stealth-browser
+opencode mcp add --global stealth-browser -- stealth-browser
+```
+
+Or add the following to your agent's config (`~/.gemini/config/mcp_config.json`, `~/.config/opencode/opencode.jsonc`, `~/.claude.json`, or `.cursor/mcp.json`). No username-specific path needed:
 
 ```json
 {
 	"mcpServers": {
 		"stealth-browser": {
-			"command": "uv",
-			"args": [
-				"run",
-				"--script",
-				"/Users/your-username/repos/stealth-browser-mcp/bin/stealth-browser"
-			]
+			"command": "stealth-browser",
+			"args": []
 		}
 	}
 }
 ```
 
-Use the absolute path to your local checkout (avoid `~` in JSON).
+### Other install methods
+
+- **No install (try it):** `uvx --from stealthmcp stealth-browser --doctor`, or run straight from the source without a checkout: `uv run https://raw.githubusercontent.com/levontumanyan/stealth-browser-mcp/main/bin/stealth_browser.py --doctor`.
+- **pipx:** `pipx install stealthmcp`, then the same `stealth-browser` command.
+- **Existing checkout:** `uv run --script /absolute/path/to/stealth-browser-mcp/bin/stealth-browser` keeps working unchanged. Add that checkout's `bin/` to your `PATH` and run `stealth-browser --help` for a local dev setup.
+
+## Verification
+
+`stealth-browser --doctor` checks Python, dependency versions, cheat-sheet creation, and browser/CDP availability, then exits non-zero on failure. Add `--smoke` to actually launch Chromium and open a tab. `stealth-browser --version` prints the installed version.
 
 ## Available MCP Tools
 
@@ -56,18 +79,24 @@ Use the absolute path to your local checkout (avoid `~` in JSON).
 - `evaluate_js`: Execute JavaScript in the active page context.
 - `switch_tab` / `new_tab` / `close_tab`: Full multi-tab management (closing the last tab automatically closes the browser).
 - `close_browser`: Completely close the browser window, terminate the browser process, and release all resources.
+- `wait_for_human`: Pause for interactive login/2FA/CAPTCHA with a macOS notification; pin follow-up calls to the tab's stable `tN` id.
 
 Headless by default; keep it that way and use `wait_for_human()` for interactive login/2FA/CAPTCHA.
 
 # Audit
 
-- `stealth-browser-audit [--since 14d] [--session <sid-prefix>] [--diff <baseline.json>]` — mine local AGY and OpenCode transcripts for stealth-browser usage, error rates, latency, and workarounds; produces a prioritized improvement plan or before/after scorecard.
+- `stealth-browser-audit [--since 14d] [--session <sid-prefix>] [--diff <baseline.json>]` — mine local AGY and OpenCode transcripts for stealth-browser usage, error rates, latency, and workarounds; produces a prioritized improvement plan or before/after scorecard. The audit CLI lives in the repo checkout (`bin/stealth-browser-audit`) and is not part of the installed `stealthmcp` tool.
 
-# Tests
+# Development
 
 ```sh
+git clone https://github.com/levontumanyan/stealth-browser-mcp.git
+cd stealth-browser-mcp
+uv sync
 uv run pytest tests/ -x
 ```
+
+`bin/stealth_browser.py` is the canonical source; `bin/stealth-browser` is a symlink that preserves the historical path and PEP 723 `uv run --script` workflow. Dependencies are declared in both the script's PEP 723 block and `pyproject.toml`, and a test keeps them in sync.
 
 # Agent Skills (`skills/`)
 
