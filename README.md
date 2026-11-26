@@ -62,6 +62,7 @@ Or add the following to your agent's config (`~/.gemini/config/mcp_config.json`,
 ### Other install methods
 
 - **No install (try it):** `uvx --from stealthmcp stealth-browser --doctor`, or run straight from the source without a checkout: `uv run https://raw.githubusercontent.com/levontumanyan/stealth-browser-mcp/main/bin/stealth_browser.py --doctor`.
+- **pip (in a venv):** `python3 -m venv .venv && . .venv/bin/activate && pip install stealthmcp`, then the same `stealth-browser` command. Prefer a venv over a global `pip install`.
 - **pipx:** `pipx install stealthmcp`, then the same `stealth-browser` command.
 - **Existing checkout:** `uv run --script /absolute/path/to/stealth-browser-mcp/bin/stealth-browser` keeps working unchanged. Add that checkout's `bin/` to your `PATH` and run `stealth-browser --help` for a local dev setup.
 
