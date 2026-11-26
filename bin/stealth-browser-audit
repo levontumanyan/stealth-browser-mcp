@@ -7,8 +7,8 @@
 
 import argparse
 import collections
+import concurrent.futures
 import datetime
-import glob
 import json
 import os
 import re
@@ -67,6 +67,14 @@ AUTH_KEYWORDS = (
 	"captcha",
 	"passcode",
 	"apple passwords",
+)
+AUTH_RE = re.compile("|".join(re.escape(k) for k in AUTH_KEYWORDS), re.IGNORECASE)
+AGY_FILE_NEEDLES = (
+	b"stealth-browser",
+	b"chrome-devtools",
+	b"playwright",
+	b'"browser"',
+	b'\\"browser\\"',
 )
 
 HEADER_LINE_RE = re.compile(r"^(Created At|Completed At):\s*(\S+)\s*$")
@@ -198,22 +206,25 @@ def normalize_args(raw: Any) -> dict[str, Any]:
 def strip_agy_headers(text: str) -> tuple[str, Optional[datetime.datetime], Optional[datetime.datetime]]:
 	if not text:
 		return "", None, None
-	lines = text.splitlines()
 	created: Optional[datetime.datetime] = None
 	completed: Optional[datetime.datetime] = None
-	body_start = 0
-	for idx, line in enumerate(lines):
+	pos = 0
+	n = len(text)
+	while pos < n and (text.startswith("Created At:", pos) or text.startswith("Completed At:", pos)):
+		nl = text.find("\n", pos)
+		line = text[pos:] if nl == -1 else text[pos:nl]
 		m = HEADER_LINE_RE.match(line)
 		if not m:
-			body_start = idx
 			break
 		label, ts_str = m.group(1), m.group(2)
 		if label == "Created At" and created is None:
 			created = parse_ts(ts_str)
 		elif label == "Completed At" and completed is None:
 			completed = parse_ts(ts_str)
-		body_start = idx + 1
-	body = "\n".join(lines[body_start:]).strip()
+		pos = n if nl == -1 else nl + 1
+	body = text[pos:].strip()
+	if "\r" in body:
+		body = body.replace("\r\n", "\n")
 	return body, created, completed
 
 
@@ -240,17 +251,157 @@ def load_agy_titles() -> dict[str, str]:
 		conn = sqlite3.connect(f"file:{SUMMARY_DB}?mode=ro", uri=True)
 		cur = conn.cursor()
 		tables = [r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+		ordered: list[str] = []
+		if "conversation_summaries" in tables:
+			ordered.append("conversation_summaries")
 		for table in tables:
+			if table == "conversation_summaries" or "_fts_" in table:
+				continue
+			ordered.append(table)
+		for table in ordered:
 			cols = [r[1] for r in cur.execute(f"PRAGMA table_info({table})")]
 			id_col = "conversation_id" if "conversation_id" in cols else ("id" if "id" in cols else None)
 			if id_col and "title" in cols:
 				for cid, title in cur.execute(f"SELECT {id_col}, title FROM {table}"):
 					if cid and title:
-						titles[str(cid)] = str(title)
+						key = str(cid)
+						if key not in titles:
+							titles[key] = str(title)
 		conn.close()
 	except Exception:
 		pass
 	return titles
+
+
+def _iter_agy_transcripts(brain_dir: Path) -> list[tuple[str, str]]:
+	entries: list[tuple[str, str]] = []
+	try:
+		with os.scandir(brain_dir) as it:
+			for entry in it:
+				if not entry.is_dir(follow_symlinks=False):
+					continue
+				logs_dir = os.path.join(entry.path, ".system_generated", "logs")
+				full_path = os.path.join(logs_dir, "transcript_full.jsonl")
+				if os.path.isfile(full_path):
+					entries.append((entry.name, full_path))
+					continue
+				compact_path = os.path.join(logs_dir, "transcript.jsonl")
+				if os.path.isfile(compact_path):
+					entries.append((entry.name, compact_path))
+	except OSError:
+		return []
+	entries.sort(key=lambda pair: pair[0])
+	return entries
+
+
+def _parse_agy_file(
+	cid: str,
+	path_str: str,
+	since: Optional[datetime.datetime],
+) -> Optional[tuple[str, datetime.datetime, list[tuple[dict[str, Any], list[str]]], bytes]]:
+	try:
+		st = os.stat(path_str)
+	except OSError:
+		return None
+	file_dt = datetime.datetime.fromtimestamp(st.st_mtime, tz=datetime.timezone.utc)
+	if since is not None and file_dt < since:
+		return None
+	try:
+		raw_bytes = Path(path_str).read_bytes()
+	except OSError:
+		return None
+	if not any(needle in raw_bytes for needle in AGY_FILE_NEEDLES):
+		return None
+
+	lines = raw_bytes.splitlines()
+	turns: list[tuple[dict[str, Any], list[str]]] = []
+	n = len(lines)
+	for i in range(n):
+		line = lines[i]
+		if b'"tool_calls"' not in line:
+			continue
+		if b'"call_mcp_tool"' not in line and b'"read_file"' not in line and b'"invoke_subagent"' not in line:
+			continue
+		try:
+			step = json.loads(line)
+		except Exception:
+			continue
+		tcs = step.get("tool_calls")
+		if not tcs:
+			continue
+		generics: list[str] = []
+		j = i + 1
+		while j < n:
+			l2 = lines[j]
+			if b'"PLANNER_RESPONSE"' in l2:
+				try:
+					s2 = json.loads(l2)
+				except Exception:
+					j += 1
+					continue
+				stype = s2.get("type")
+				if stype == "PLANNER_RESPONSE":
+					break
+				if stype == "GENERIC":
+					generics.append(str(s2.get("content", "")))
+			elif b'"GENERIC"' in l2:
+				try:
+					s2 = json.loads(l2)
+				except Exception:
+					j += 1
+					continue
+				if s2.get("type") == "GENERIC":
+					generics.append(str(s2.get("content", "")))
+			j += 1
+		turns.append((step, generics))
+	return cid, file_dt, turns, raw_bytes
+
+
+def _build_opencode_filters(
+	cur: sqlite3.Cursor,
+	table: str,
+	includes: list[str],
+	since: Optional[datetime.datetime],
+	sess_table: Optional[str] = None,
+) -> tuple[str, list[Any]]:
+	clauses: list[str] = []
+	params: list[Any] = []
+	if includes and len(includes) <= 200:
+		inc_parts: list[str] = []
+		for prefix in includes:
+			if not prefix:
+				continue
+			upper = prefix[:-1] + chr(ord(prefix[-1]) + 1)
+			inc_parts.append("(session_id >= ? AND session_id < ?)")
+			params.extend((prefix, upper))
+		if inc_parts:
+			clauses.append("(" + " OR ".join(inc_parts) + ")")
+	if since is not None:
+		pushed_session_time = False
+		if sess_table:
+			sess_cols = {r[1] for r in cur.execute(f"PRAGMA table_info({sess_table})")}
+			if "time_updated" in sess_cols:
+				sample = cur.execute(
+					f"SELECT time_updated FROM {sess_table} WHERE time_updated IS NOT NULL LIMIT 1"
+				).fetchone()
+				if sample is not None and isinstance(sample[0], (int, float)):
+					cutoff_s = since.timestamp() - 3600.0
+					cutoff = cutoff_s * 1000.0 if sample[0] > 1e11 else cutoff_s
+					clauses.append(
+						f"session_id IN (SELECT id FROM {sess_table} WHERE time_updated IS NULL OR time_updated >= ?)"
+					)
+					params.append(cutoff)
+					pushed_session_time = True
+		if not pushed_session_time:
+			sample = cur.execute(
+				f"SELECT time_created FROM {table} WHERE time_created IS NOT NULL LIMIT 1"
+			).fetchone()
+			if sample is not None and isinstance(sample[0], (int, float)):
+				cutoff_s = since.timestamp() - 3600.0
+				cutoff = cutoff_s * 1000.0 if sample[0] > 1e11 else cutoff_s
+				clauses.append("(time_created IS NULL OR time_created >= ?)")
+				params.append(cutoff)
+	return (" AND ".join(clauses), params)
 
 
 def harness_validation_tool(body: str) -> Optional[str]:
@@ -809,7 +960,16 @@ class AuditCollector:
 		sess_state["prev_errored"] = is_hard_error
 		sess_state["prev_was_screenshot"] = tool == "screenshot"
 
-	def _finalize_session(self, source: str, sid: str, title: str, sess_state: dict[str, Any], raw_text_lower: str) -> None:
+	def _finalize_session(
+		self,
+		source: str,
+		sid: str,
+		title: str,
+		sess_state: dict[str, Any],
+		raw_text_lower: str = "",
+		*,
+		has_auth: Optional[bool] = None,
+	) -> None:
 		self.schema_reads_total += sess_state["schema_reads"]
 		self.schema_chars_total += sess_state["schema_chars"]
 		self.input_chars_total += sess_state["input_chars"]
@@ -818,7 +978,9 @@ class AuditCollector:
 		self.sessions_by_source[source] += 1
 		self.schema_reads_in_browser_sessions += sess_state["schema_reads"]
 		self.agy_overflow_expansions += sess_state["overflows"]
-		if any(k in raw_text_lower for k in AUTH_KEYWORDS):
+		if has_auth is None:
+			has_auth = bool(AUTH_RE.search(raw_text_lower)) if raw_text_lower else False
+		if has_auth:
 			self.auth_sessions += 1
 		self.sessions.append({
 			"source": source,
@@ -849,51 +1011,31 @@ class AuditCollector:
 		self._sources_collected.add("agy")
 		titles = load_agy_titles()
 		self._titles_by_source["agy"] = titles
-		log_glob = str(BRAIN_DIR / "*" / ".system_generated" / "logs" / "transcript.jsonl")
-		full_glob = str(BRAIN_DIR / "*" / ".system_generated" / "logs" / "transcript_full.jsonl")
-		compact_by_cid = {Path(p).parts[-4]: p for p in sorted(glob.glob(log_glob))}
-		full_by_cid = {Path(p).parts[-4]: p for p in glob.glob(full_glob)}
-		paths = [(cid, full_by_cid.get(cid) or compact_by_cid[cid]) for cid in sorted(set(compact_by_cid) | set(full_by_cid))]
+		paths = _iter_agy_transcripts(BRAIN_DIR)
 		matched_ids: set[str] = set()
+		target_paths: list[tuple[str, str]] = []
 
 		for cid, path_str in paths:
-			path = Path(path_str)
 			if self.includes and matches_any_prefix(cid, self.includes):
 				matched_ids.add(cid)
-
 			if not should_audit_session(cid, self.includes, self.excludes):
 				continue
+			target_paths.append((cid, path_str))
 
-			if self.since is not None:
-				try:
-					mtime = datetime.datetime.fromtimestamp(path.stat().st_mtime, tz=datetime.timezone.utc)
-					if mtime < self.since:
-						continue
-				except OSError:
-					continue
+		if len(target_paths) > 16:
+			with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+				parsed_results = list(
+					pool.map(lambda pair: _parse_agy_file(pair[0], pair[1], self.since), target_paths)
+				)
+		else:
+			parsed_results = [_parse_agy_file(cid, path_str, self.since) for cid, path_str in target_paths]
 
-			try:
-				raw = path.read_text(encoding="utf-8", errors="ignore")
-			except OSError:
+		for parsed in parsed_results:
+			if parsed is None:
 				continue
-
-			if (
-				"stealth-browser" not in raw
-				and "chrome-devtools" not in raw
-				and "playwright" not in raw
-				and '"browser"' not in raw
-				and '\\"browser\\"' not in raw
-			):
+			cid, file_dt, turns, raw_bytes = parsed
+			if not turns:
 				continue
-
-			steps: list[dict[str, Any]] = []
-			for line in raw.splitlines():
-				if not line.strip():
-					continue
-				try:
-					steps.append(json.loads(line))
-				except Exception:
-					continue
 
 			sess_state: dict[str, Any] = {
 				"calls": 0,
@@ -917,65 +1059,83 @@ class AuditCollector:
 				"snapshot_rows": 0,
 				"last_js_intent": "",
 			}
-			file_dt = datetime.datetime.fromtimestamp(path.stat().st_mtime, tz=datetime.timezone.utc)
 			title = titles.get(cid, "")
 
-			for i, step in enumerate(steps):
+			for step, generic_outputs in turns:
 				tcs = step.get("tool_calls") or []
-				if not tcs:
-					continue
-				step_dt = parse_ts(step.get("created_at")) or file_dt
-
-				generic_outputs: list[str] = []
-				j = i + 1
-				while j < len(steps) and steps[j].get("type") != "PLANNER_RESPONSE":
-					if steps[j].get("type") == "GENERIC":
-						generic_outputs.append(str(steps[j].get("content", "")))
-					j += 1
+				step_dt: Optional[datetime.datetime] = None
 
 				for idx, tc in enumerate(tcs):
 					name = tc.get("name", "")
-					args = tc.get("args") or {}
-					out = generic_outputs[idx] if idx < len(generic_outputs) else ""
-					body, created_dt, completed_dt = strip_agy_headers(out)
-					call_dt = created_dt or step_dt
-
-					if self.since is not None and call_dt < self.since:
+					if name not in ("call_mcp_tool", "read_file", "invoke_subagent"):
 						continue
+					args = tc.get("args") or {}
 
 					if name == "read_file":
 						p = str(unquote(args.get("Path", "")))
-						if "/mcp/stealth-browser/" in p:
+						is_schema = "/mcp/stealth-browser/" in p
+						is_ss_read = sess_state["prev_was_screenshot"] and (
+							"screenshot" in p.lower() or p.lower().endswith(".png")
+						)
+						if not (is_schema or is_ss_read):
+							continue
+						out = generic_outputs[idx] if idx < len(generic_outputs) else ""
+						body, created_dt, _ = strip_agy_headers(out)
+						if step_dt is None:
+							step_dt = parse_ts(step.get("created_at")) or file_dt
+						call_dt = created_dt or step_dt
+						if self.since is not None and call_dt < self.since:
+							continue
+						if is_schema:
 							sess_state["schema_reads"] += 1
 							sess_state["schema_chars"] += len(body)
-						if sess_state["prev_was_screenshot"] and ("screenshot" in p.lower() or p.lower().endswith(".png")):
+						if is_ss_read:
 							self.screenshot_followed_by_read += 1
 							sess_state["prev_was_screenshot"] = False
 						continue
 
 					if name == "invoke_subagent":
 						tn = str(unquote(args.get("TypeName", "")))
-						if "browser" in tn.lower():
-							self.browser_subagents.append({
-								"sid": cid[:10],
-								"title": title[:40],
-								"type": tn,
-								"role": str(unquote(args.get("Role", ""))),
-							})
-						continue
-
-					if name != "call_mcp_tool":
+						if "browser" not in tn.lower():
+							continue
+						out = generic_outputs[idx] if idx < len(generic_outputs) else ""
+						_, created_dt, _ = strip_agy_headers(out)
+						if step_dt is None:
+							step_dt = parse_ts(step.get("created_at")) or file_dt
+						call_dt = created_dt or step_dt
+						if self.since is not None and call_dt < self.since:
+							continue
+						self.browser_subagents.append({
+							"sid": cid[:10],
+							"title": title[:40],
+							"type": tn,
+							"role": str(unquote(args.get("Role", ""))),
+						})
 						continue
 
 					srv = str(unquote(args.get("ServerName", "")))
 					tool = str(unquote(args.get("ToolName", "")))
-					raw_args = normalize_args(args.get("Arguments", {}))
 
 					if srv != "stealth-browser":
 						if any(k in srv.lower() for k in ("browser", "chrome", "playwright")):
-							self.other_browser_mcps[f"{srv}:{tool}"] += 1
+							out = generic_outputs[idx] if idx < len(generic_outputs) else ""
+							_, created_dt, _ = strip_agy_headers(out)
+							if step_dt is None:
+								step_dt = parse_ts(step.get("created_at")) or file_dt
+							call_dt = created_dt or step_dt
+							if self.since is None or call_dt >= self.since:
+								self.other_browser_mcps[f"{srv}:{tool}"] += 1
 						continue
 
+					out = generic_outputs[idx] if idx < len(generic_outputs) else ""
+					body, created_dt, completed_dt = strip_agy_headers(out)
+					if step_dt is None:
+						step_dt = parse_ts(step.get("created_at")) or file_dt
+					call_dt = created_dt or step_dt
+					if self.since is not None and call_dt < self.since:
+						continue
+
+					raw_args = normalize_args(args.get("Arguments", {}))
 					if not sess_state["date"]:
 						sess_state["date"] = call_dt.astimezone().strftime("%Y-%m-%d")
 
@@ -1001,7 +1161,10 @@ class AuditCollector:
 						overflow=overflowed,
 					)
 
-			self._finalize_session("agy", cid, title, sess_state, raw.lower())
+			has_auth = False
+			if sess_state["calls"] > 0:
+				has_auth = bool(AUTH_RE.search(raw_bytes.decode("utf-8", errors="ignore")))
+			self._finalize_session("agy", cid, title, sess_state, has_auth=has_auth)
 
 		self._matched_ids_by_source["agy"] = matched_ids
 
@@ -1156,11 +1319,22 @@ class AuditCollector:
 						seen_call_ids.add(call_id)
 
 					raw_name = str(item.get("name") or item.get("toolName") or item.get("tool") or "")
+					if raw_name not in ("read", "read_file", "shell", "execute", "bash"):
+						kind, tool = extract_opencode_tool_name(raw_name)
+						if kind is None or not tool:
+							return
+					else:
+						kind, tool = None, None
+
 					state = item.get("state") if isinstance(item.get("state"), dict) else {}
 					start_dt, end_dt = extract_opencode_item_time(item)
 					if start_dt is None:
 						start_dt = parse_ts(row_ts)
 					if self.since is not None and start_dt is not None and start_dt < self.since:
+						return
+
+					if kind == "other" and tool:
+						self.other_browser_mcps[f"opencode:{tool}"] += 1
 						return
 
 					inp = normalize_args(item.get("args") or item.get("input") or state.get("input") or {})
@@ -1189,10 +1363,6 @@ class AuditCollector:
 						)
 						return
 
-					kind, tool = extract_opencode_tool_name(raw_name)
-					if kind == "other" and tool:
-						self.other_browser_mcps[f"opencode:{tool}"] += 1
-						return
 					if kind != "stealth-browser" or not tool:
 						return
 
@@ -1218,15 +1388,21 @@ class AuditCollector:
 					)
 
 				if "session_message" in tables:
-					rows = cur.execute(
+					extra_where, extra_params = _build_opencode_filters(
+						cur, "session_message", self.includes, self.since, sess_table
+					)
+					sql = (
 						"SELECT session_id, time_created, data FROM session_message "
-						"WHERE data LIKE '%stealth%' OR data LIKE '%playwright%' OR data LIKE '%chrome%'"
-					).fetchall()
+						"WHERE (data LIKE '%stealth%' OR data LIKE '%playwright%' OR data LIKE '%chrome%')"
+					)
+					if extra_where:
+						sql += f" AND {extra_where} ORDER BY rowid"
+					rows = cur.execute(sql, extra_params).fetchall()
 					for sid, tc, raw in rows:
 						sid = str(sid)
 						if not should_audit_session(sid, self.includes, self.excludes):
 							continue
-						per_session_text[sid].append(raw[:2000].lower())
+						per_session_text[sid].append(raw[:2000])
 						try:
 							obj = json.loads(raw)
 						except Exception:
@@ -1241,15 +1417,21 @@ class AuditCollector:
 				for part_table in ("session_part", "part"):
 					if part_table not in tables:
 						continue
-					rows = cur.execute(
+					extra_where, extra_params = _build_opencode_filters(
+						cur, part_table, self.includes, self.since, sess_table
+					)
+					sql = (
 						f"SELECT session_id, time_created, data FROM {part_table} "
 						"WHERE type = 'tool' AND (data LIKE '%stealth%' OR data LIKE '%playwright%' OR data LIKE '%chrome%')"
-					).fetchall()
+					)
+					if extra_where:
+						sql += f" AND {extra_where} ORDER BY rowid"
+					rows = cur.execute(sql, extra_params).fetchall()
 					for sid, tc, raw in rows:
 						sid = str(sid)
 						if not should_audit_session(sid, self.includes, self.excludes):
 							continue
-						per_session_text[sid].append(raw[:2000].lower())
+						per_session_text[sid].append(raw[:2000])
 						try:
 							item = json.loads(raw)
 						except Exception:
@@ -1258,12 +1440,15 @@ class AuditCollector:
 							handle_tool_item(sid, tc, item)
 
 				for sid, sess_state in per_session.items():
+					has_auth = False
+					if sess_state["calls"] > 0:
+						has_auth = bool(AUTH_RE.search(" ".join(per_session_text.get(sid, []))))
 					self._finalize_session(
 						"opencode",
 						sid,
 						titles.get(sid, ""),
 						sess_state,
-						" ".join(per_session_text.get(sid, [])),
+						has_auth=has_auth,
 					)
 			except sqlite3.Error:
 				pass
