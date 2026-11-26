@@ -831,3 +831,70 @@ class TestSessionCache:
 		c2 = sba.AuditCollector(since=None, includes=[], excludes=[], slow_threshold=20.0, max_samples=2, cache_dir=blocker, use_cache=True)
 		c2.collect_agy()
 		assert c2.sessions[0]["chars"] == 60
+
+	def test_orphan_row_pruning_on_unscoped_full_scans(self, agy_env, tmp_path, monkeypatch):
+		import shutil
+
+		_write_agy_session(agy_env, "cid-keep", "compact", "K" * 50)
+		_write_agy_session(agy_env, "cid-gone", "compact", "G" * 50)
+		cache_dir = agy_env / ".cache"
+
+		c1 = sba.AuditCollector(since=None, includes=[], excludes=[], slow_threshold=20.0, max_samples=2, cache_dir=cache_dir)
+		c1.collect_agy()
+		db_file = cache_dir / f"cache-v{sba.CACHE_SCHEMA_VERSION}.sqlite"
+
+		def _cached_ids(source: str) -> set[str]:
+			conn = sqlite3.connect(db_file)
+			try:
+				return {r[0] for r in conn.execute("SELECT session_id FROM sessions WHERE source = ?", (source,))}
+			finally:
+				conn.close()
+
+		assert _cached_ids("agy") == {"cid-keep", "cid-gone"}
+
+		shutil.rmtree(agy_env / "cid-gone")
+
+		c_scoped = sba.AuditCollector(since=None, includes=["cid-keep"], excludes=[], slow_threshold=20.0, max_samples=2, cache_dir=cache_dir)
+		c_scoped.collect_agy()
+		assert _cached_ids("agy") == {"cid-keep", "cid-gone"}
+
+		c_since = sba.AuditCollector(
+			since=datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc),
+			includes=[],
+			excludes=[],
+			slow_threshold=20.0,
+			max_samples=2,
+			cache_dir=cache_dir,
+		)
+		c_since.collect_agy()
+		assert _cached_ids("agy") == {"cid-keep", "cid-gone"}
+
+		c_full = sba.AuditCollector(since=None, includes=[], excludes=["cid-keep"], slow_threshold=20.0, max_samples=2, cache_dir=cache_dir)
+		c_full.collect_agy()
+		assert _cached_ids("agy") == {"cid-keep"}
+
+		oc_dir = tmp_path / "oc"
+		oc_dir.mkdir()
+		oc_db = oc_dir / "opencode.db"
+		ts1 = int(datetime.datetime(2026, 11, 20, 12, 0, tzinfo=datetime.timezone.utc).timestamp() * 1000)
+		conn = sqlite3.connect(oc_db)
+		conn.execute("CREATE TABLE session_v2 (id TEXT PRIMARY KEY, title TEXT, time_updated INTEGER)")
+		conn.execute("CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT)")
+		conn.execute("INSERT INTO session_v2 VALUES ('ses_keep', 'Keep', ?)", (ts1,))
+		conn.execute("INSERT INTO session_v2 VALUES ('ses_gone', 'Gone', ?)", (ts1,))
+		conn.commit()
+		conn.close()
+
+		monkeypatch.setattr(sba, "OPENCODE_DIR", oc_dir)
+		oc1 = sba.AuditCollector(since=None, includes=[], excludes=[], slow_threshold=20.0, max_samples=2, cache_dir=cache_dir)
+		oc1.collect_opencode()
+		assert _cached_ids("opencode") == {"opencode.db:ses_keep", "opencode.db:ses_gone"}
+
+		conn = sqlite3.connect(oc_db)
+		conn.execute("DELETE FROM session_v2 WHERE id = 'ses_gone'")
+		conn.commit()
+		conn.close()
+
+		oc_full = sba.AuditCollector(since=None, includes=[], excludes=["ses_keep"], slow_threshold=20.0, max_samples=2, cache_dir=cache_dir)
+		oc_full.collect_opencode()
+		assert _cached_ids("opencode") == {"opencode.db:ses_keep"}

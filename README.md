@@ -106,7 +106,7 @@ Headless by default; keep it that way and use `wait_for_human()` for interactive
 
 # Audit
 
-- `stealth-browser-audit [--since 14d] [--session <sid-prefix>] [--diff <baseline.json>]` — mine local AGY and OpenCode transcripts for stealth-browser usage, error rates, latency, and workarounds; produces a prioritized improvement plan or before/after scorecard. The audit CLI lives in the repo checkout (`bin/stealth-browser-audit`) and is not part of the installed `stealthmcp` tool.
+- `stealth-browser-audit [--since 14d] [--session <sid-prefix>] [--diff <baseline.json>] [--no-cache]` — mine local AGY and OpenCode transcripts for stealth-browser usage, error rates, latency, and workarounds; produces a prioritized improvement plan or before/after scorecard. Installed alongside `stealth-browser` by `stealthmcp` and also runnable directly from a checkout via `bin/stealth-browser-audit`.
 
 # Development
 
