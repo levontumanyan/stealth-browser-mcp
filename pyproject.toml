@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [project.scripts]
-stealth-browser = "stealth_browser:main"
+stealth-browser = "stealth_browser_cli:main"
 stealth-browser-audit = "stealth_browser_audit:main"
 
 [project.urls]
@@ -36,5 +36,5 @@ dev = [
 path = "bin/stealth_browser.py"
 
 [tool.hatch.build.targets.wheel]
-only-include = ["bin/stealth_browser.py", "bin/stealth_browser_audit.py"]
+only-include = ["bin/stealth_browser.py", "bin/stealth_browser_cli.py", "bin/stealth_browser_audit.py"]
 sources = ["bin"]

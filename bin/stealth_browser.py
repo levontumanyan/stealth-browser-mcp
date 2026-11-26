@@ -11,528 +11,69 @@
 
 __version__ = "0.1.0"
 
+import os
+import sys
+
+_SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+if _SCRIPT_DIR not in sys.path:
+	sys.path.insert(0, _SCRIPT_DIR)
+
 import argparse
 import fcntl
 import hashlib
 import http.client
 import json
-import os
 import secrets
 import signal
 import socket
 import subprocess
-import sys
 import threading
 import time
 from typing import Any, Optional
 
-CDP_PORT = int(os.environ.get("STEALTH_BROWSER_CDP_PORT", os.environ.get("CDP_PORT", "9222")))
-CDP_URL = f"http://127.0.0.1:{CDP_PORT}"
-PROFILE_DIR = os.path.expanduser(os.environ.get("STEALTH_BROWSER_PROFILE_DIR", "~/.agent-chromium-profile"))
-DAEMON_DEFAULT_HTTP = "127.0.0.1:9223"
-DAEMON_DEFAULT_IDLE_EXIT = 1800
-_HEAVY_CLI_FLAGS = frozenset({"--serve", "--standalone", "--install-browser", "--doctor", "--smoke"})
-
-
-def _build_arg_parser() -> argparse.ArgumentParser:
-	parser = argparse.ArgumentParser(
-		prog="stealth-browser",
-		description="FastMCP server providing browser automation tools over CDP or standalone stealth Chromium using patchright.",
-	)
-	parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-	parser.add_argument("--install-browser", action="store_true", help="Download the Patchright Chromium build used by the stealth browser")
-	parser.add_argument("--doctor", action="store_true", help="Check installation health and verify the MCP server can start")
-	parser.add_argument("--smoke", action="store_true", help="With --doctor, launch the browser and open a tab")
-	parser.add_argument("--serve", action="store_true", help="Run shared daemon on a 0600 Unix Domain Socket (auto-started by default stdio proxy)")
-	parser.add_argument(
-		"--http",
-		nargs="?",
-		const=DAEMON_DEFAULT_HTTP,
-		default=None,
-		metavar="HOST:PORT",
-		help=f"With --serve, also expose loopback Streamable HTTP with mandatory Bearer token auth (default: {DAEMON_DEFAULT_HTTP})",
-	)
-	parser.add_argument(
-		"--daemon-idle-exit",
-		type=int,
-		default=DAEMON_DEFAULT_IDLE_EXIT,
-		metavar="SECONDS",
-		help=f"With --serve, exit daemon after SECONDS idle with 0 active clients (0 disables; default: {DAEMON_DEFAULT_IDLE_EXIT})",
-	)
-	parser.add_argument("--daemon-status", action="store_true", help="Print shared daemon status and exit")
-	parser.add_argument("--daemon-stop", action="store_true", help="Stop the running shared daemon cleanly and exit")
-	parser.add_argument("--standalone", action="store_true", help="Run direct in-process stdio MCP server instead of proxying to the shared daemon")
-	return parser
-
-
-def _daemon_paths(
-	cdp_port: Optional[int] = None,
-	profile_dir: Optional[str] = None,
-	runtime_dir: Optional[str] = None,
-	token_path: Optional[str] = None,
-) -> dict[str, str]:
-	port = CDP_PORT if cdp_port is None else int(cdp_port)
-	prof = os.path.expanduser(PROFILE_DIR if profile_dir is None else profile_dir)
-	rdir = os.path.expanduser(
-		runtime_dir
-		if runtime_dir is not None
-		else os.environ.get("STEALTH_BROWSER_RUNTIME_DIR", "~/.cache/stealth-browser")
-	)
-	tpath = os.path.expanduser(
-		token_path
-		if token_path is not None
-		else os.environ.get("STEALTH_BROWSER_TOKEN_FILE", "~/.config/stealth-browser/daemon.token")
-	)
-	profile_hash = hashlib.sha256(os.path.realpath(prof).encode("utf-8")).hexdigest()[:8]
-	stem = f"sb-{port}-{profile_hash}"
-	return {
-		"runtime_dir": rdir,
-		"sock_path": os.path.join(rdir, f"{stem}.sock"),
-		"lock_path": os.path.join(rdir, f"{stem}.lock"),
-		"meta_path": os.path.join(rdir, f"{stem}.json"),
-		"token_path": tpath,
-	}
-
-
-def _script_sha256() -> str:
-	try:
-		with open(os.path.realpath(__file__), "rb") as f:
-			return hashlib.sha256(f.read()).hexdigest()[:16]
-	except Exception:
-		return ""
-
-
-def _parse_loopback_http(addr: str) -> tuple[str, int]:
-	raw = (addr or "").strip()
-	if not raw:
-		raise ValueError("HTTP bind address must not be empty")
-	if raw.startswith("["):
-		bracket_end = raw.find("]")
-		if bracket_end < 0:
-			raise ValueError(f"Invalid IPv6 bind address: {addr!r}")
-		host = raw[1:bracket_end]
-		rest = raw[bracket_end + 1:]
-		if not rest.startswith(":"):
-			raise ValueError(f"Missing port in HTTP bind address: {addr!r}")
-		port_str = rest[1:]
-	elif ":" in raw:
-		host, port_str = raw.rsplit(":", 1)
-	else:
-		raise ValueError(f"HTTP bind address must be HOST:PORT (got {addr!r})")
-	if host not in ("127.0.0.1", "localhost", "::1"):
-		raise ValueError(f"Refusing non-loopback HTTP bind host {host!r}; only 127.0.0.1, localhost, or ::1 are permitted")
-	try:
-		port = int(port_str)
-	except ValueError as exc:
-		raise ValueError(f"Invalid port in HTTP bind address {addr!r}") from exc
-	if not (1 <= port <= 65535):
-		raise ValueError(f"Port out of range (1-65535): {port}")
-	return host, port
-
-
-def _ensure_daemon_token(token_path: Optional[str] = None) -> str:
-	path = token_path or _daemon_paths()["token_path"]
-	parent = os.path.dirname(path)
-	if parent:
-		os.makedirs(parent, mode=0o700, exist_ok=True)
-		try:
-			os.chmod(parent, 0o700)
-		except OSError:
-			pass
-	if os.path.isfile(path):
-		try:
-			os.chmod(path, 0o600)
-		except OSError:
-			pass
-		with open(path, "r", encoding="utf-8") as f:
-			existing = f.read().strip()
-		if existing:
-			return existing
-	token = secrets.token_urlsafe(32)
-	fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-	try:
-		os.write(fd, (token + "\n").encode("utf-8"))
-	finally:
-		os.close(fd)
-	try:
-		os.chmod(path, 0o600)
-	except OSError:
-		pass
-	return token
-
-
-class _UnixHTTPConnection(http.client.HTTPConnection):
-	def __init__(self, sock_path: str, timeout: float = 300.0):
-		super().__init__("localhost", timeout=timeout)
-		self._sock_path = sock_path
-
-	def connect(self):
-		sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-		sock.settimeout(self.timeout)
-		sock.connect(self._sock_path)
-		self.sock = sock
-
-
-def _uds_request(
-	sock_path: str,
-	method: str,
-	path: str,
-	body: Optional[bytes] = None,
-	headers: Optional[dict[str, str]] = None,
-	timeout: float = 5.0,
-) -> tuple[int, dict[str, str], bytes]:
-	conn = _UnixHTTPConnection(sock_path, timeout=timeout)
-	try:
-		req_headers = {"Host": "localhost"}
-		if headers:
-			req_headers.update(headers)
-		conn.request(method, path, body=body, headers=req_headers)
-		resp = conn.getresponse()
-		data = resp.read()
-		resp_headers = {k.lower(): v for k, v in resp.getheaders()}
-		return resp.status, resp_headers, data
-	finally:
-		try:
-			conn.close()
-		except Exception:
-			pass
-
-
-def _probe_daemon_health(sock_path: str, timeout: float = 1.0) -> Optional[dict]:
-	if not os.path.exists(sock_path):
-		return None
-	try:
-		status_code, _, data = _uds_request(sock_path, "GET", "/_daemon/health", timeout=timeout)
-		if status_code == 200:
-			parsed = json.loads(data.decode("utf-8", errors="ignore"))
-			if isinstance(parsed, dict) and parsed.get("ok"):
-				return parsed
-	except Exception:
-		return None
-	return None
-
-
-def _stop_daemon(sock_path: str, meta_path: str, timeout: float = 5.0) -> bool:
-	stopped_req = False
-	if os.path.exists(sock_path):
-		try:
-			status_code, _, _ = _uds_request(sock_path, "POST", "/_daemon/stop", body=b"{}", timeout=2.0)
-			stopped_req = status_code == 200
-		except Exception:
-			pass
-	if not stopped_req and os.path.isfile(meta_path):
-		try:
-			with open(meta_path, "r", encoding="utf-8") as f:
-				meta = json.load(f)
-			pid = int(meta.get("pid", 0))
-			if pid > 0:
-				os.kill(pid, signal.SIGTERM)
-				stopped_req = True
-		except Exception:
-			pass
-	if not stopped_req:
-		return False
-	deadline = time.monotonic() + timeout
-	while time.monotonic() < deadline:
-		if _probe_daemon_health(sock_path, timeout=0.3) is None:
-			return True
-		time.sleep(0.05)
-	return _probe_daemon_health(sock_path, timeout=0.3) is None
-
-
-def _ensure_daemon_running(
-	cdp_port: Optional[int] = None,
-	profile_dir: Optional[str] = None,
-	runtime_dir: Optional[str] = None,
-	idle_exit_s: int = DAEMON_DEFAULT_IDLE_EXIT,
-	timeout_s: float = 10.0,
-) -> str:
-	paths = _daemon_paths(cdp_port=cdp_port, profile_dir=profile_dir, runtime_dir=runtime_dir)
-	rdir = paths["runtime_dir"]
-	sock_path = paths["sock_path"]
-	lock_path = paths["lock_path"]
-	meta_path = paths["meta_path"]
-	os.makedirs(rdir, mode=0o700, exist_ok=True)
-	try:
-		os.chmod(rdir, 0o700)
-	except OSError:
-		pass
-
-	expected_hash = _script_sha256()
-	health = _probe_daemon_health(sock_path)
-	if health is not None:
-		if not expected_hash or health.get("script_hash") == expected_hash:
-			return sock_path
-		if health.get("in_flight", 0) == 0 and health.get("active_sessions", 0) == 0:
-			_stop_daemon(sock_path, meta_path, timeout=3.0)
-		else:
-			return sock_path
-
-	with open(lock_path, "w", encoding="utf-8") as lock_file:
-		fcntl.flock(lock_file, fcntl.LOCK_EX)
-		try:
-			health = _probe_daemon_health(sock_path)
-			if health is not None:
-				return sock_path
-			if os.path.exists(sock_path):
-				try:
-					os.unlink(sock_path)
-				except OSError:
-					pass
-			cmd = [
-				sys.executable,
-				os.path.realpath(__file__),
-				"--serve",
-				"--daemon-idle-exit",
-				str(idle_exit_s),
-			]
-			env = os.environ.copy()
-			if runtime_dir is not None:
-				env["STEALTH_BROWSER_RUNTIME_DIR"] = rdir
-			if cdp_port is not None:
-				env["STEALTH_BROWSER_CDP_PORT"] = str(cdp_port)
-			if profile_dir is not None:
-				env["STEALTH_BROWSER_PROFILE_DIR"] = profile_dir
-			proc = subprocess.Popen(
-				cmd,
-				stdin=subprocess.DEVNULL,
-				stdout=subprocess.DEVNULL,
-				stderr=subprocess.DEVNULL,
-				start_new_session=True,
-				env=env,
-			)
-			deadline = time.monotonic() + timeout_s
-			while time.monotonic() < deadline:
-				if proc.poll() is not None:
-					raise RuntimeError(f"Shared daemon exited early with code {proc.returncode}")
-				if _probe_daemon_health(sock_path, timeout=0.3) is not None:
-					return sock_path
-				time.sleep(0.05)
-			raise TimeoutError(f"Timed out waiting for stealth-browser daemon at {sock_path}")
-		finally:
-			fcntl.flock(lock_file, fcntl.LOCK_UN)
-
-
-def _extract_mcp_payloads(content_type: str, data: bytes) -> list[bytes]:
-	if not data or not data.strip():
-		return []
-	if "text/event-stream" in (content_type or "").lower():
-		payloads: list[bytes] = []
-		data_lines: list[str] = []
-		for raw_line in data.decode("utf-8", errors="replace").splitlines():
-			if raw_line.startswith("data:"):
-				data_lines.append(raw_line[5:].lstrip(" "))
-			elif raw_line == "" and data_lines:
-				joined = "\n".join(data_lines).strip()
-				if joined:
-					payloads.append(joined.encode("utf-8"))
-				data_lines.clear()
-		if data_lines:
-			joined = "\n".join(data_lines).strip()
-			if joined:
-				payloads.append(joined.encode("utf-8"))
-		return payloads
-	return [data.strip()]
-
-
-class _StdioUdsProxy:
-	def __init__(
-		self,
-		sock_path: str,
-		in_stream=None,
-		out_stream=None,
-		request_timeout: float = 300.0,
-		reconnect_fn=None,
-	):
-		self.sock_path = sock_path
-		self.in_stream = in_stream if in_stream is not None else sys.stdin.buffer
-		self.out_stream = out_stream if out_stream is not None else sys.stdout.buffer
-		self.request_timeout = request_timeout
-		self.reconnect_fn = reconnect_fn
-		self.session_id: Optional[str] = None
-		self._write_lock = threading.Lock()
-		self._state_lock = threading.Lock()
-		self._init_raw: Optional[bytes] = None
-		self._initialized_raw: Optional[bytes] = None
-
-	def _write_line(self, payload: bytes) -> None:
-		line = payload.rstrip(b"\r\n") + b"\n"
-		with self._write_lock:
-			self.out_stream.write(line)
-			self.out_stream.flush()
-
-	def _post_mcp(self, body: bytes, session_id: Optional[str]) -> tuple[int, dict[str, str], bytes]:
-		headers = {
-			"Content-Type": "application/json",
-			"Accept": "application/json, text/event-stream",
-		}
-		if session_id:
-			headers["Mcp-Session-Id"] = session_id
-		return _uds_request(self.sock_path, "POST", "/mcp", body=body, headers=headers, timeout=self.request_timeout)
-
-	def _try_reconnect(self) -> bool:
-		if self.reconnect_fn is None or self._init_raw is None:
-			return False
-		with self._state_lock:
-			try:
-				self.sock_path = self.reconnect_fn()
-				status_code, resp_headers, _ = self._post_mcp(self._init_raw, None)
-				if status_code != 200:
-					return False
-				new_sid = resp_headers.get("mcp-session-id")
-				if new_sid:
-					self.session_id = new_sid
-				if self._initialized_raw is not None:
-					self._post_mcp(self._initialized_raw, self.session_id)
-				return True
-			except Exception:
-				return False
-
-	def _forward_message(self, raw: bytes, method: str, msg_id: Any) -> None:
-		try:
-			status_code, resp_headers, data = self._post_mcp(raw, self.session_id)
-			if status_code in (404, 502, 503) and method != "initialize" and self._try_reconnect():
-				status_code, resp_headers, data = self._post_mcp(raw, self.session_id)
-		except (OSError, http.client.HTTPException):
-			if method != "initialize" and self._try_reconnect():
-				try:
-					status_code, resp_headers, data = self._post_mcp(raw, self.session_id)
-				except Exception as exc:
-					if msg_id is not None:
-						err = json.dumps({"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32000, "message": f"Daemon connection failed: {exc}"}}).encode("utf-8")
-						self._write_line(err)
-					return
-			else:
-				if msg_id is not None:
-					err = json.dumps({"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32000, "message": "Daemon connection failed"}}).encode("utf-8")
-					self._write_line(err)
-				return
-		except Exception as exc:
-			if msg_id is not None:
-				err = json.dumps({"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32000, "message": str(exc)}}).encode("utf-8")
-				self._write_line(err)
-			return
-
-		new_sid = resp_headers.get("mcp-session-id")
-		if new_sid:
-			with self._state_lock:
-				self.session_id = new_sid
-
-		if status_code == 202 or msg_id is None:
-			return
-		payloads = _extract_mcp_payloads(resp_headers.get("content-type", ""), data)
-		if payloads:
-			for payload in payloads:
-				self._write_line(payload)
-		elif status_code >= 400:
-			msg = data.decode("utf-8", errors="replace").strip() or f"HTTP {status_code}"
-			err = json.dumps({"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32000, "message": msg}}).encode("utf-8")
-			self._write_line(err)
-
-	def close_session(self) -> None:
-		sid = self.session_id
-		if not sid:
-			return
-		try:
-			_uds_request(self.sock_path, "DELETE", "/mcp", headers={"Mcp-Session-Id": sid}, timeout=2.0)
-		except Exception:
-			pass
-
-	def run(self) -> int:
-		threads: list[threading.Thread] = []
-		try:
-			while True:
-				line = self.in_stream.readline()
-				if not line:
-					break
-				raw = line.strip()
-				if not raw:
-					continue
-				try:
-					parsed = json.loads(raw.decode("utf-8"))
-				except Exception:
-					continue
-				method = parsed.get("method", "") if isinstance(parsed, dict) else ""
-				msg_id = parsed.get("id") if isinstance(parsed, dict) else None
-				if method == "initialize":
-					self._init_raw = raw
-					self._forward_message(raw, method, msg_id)
-				elif method == "notifications/initialized":
-					self._initialized_raw = raw
-					self._forward_message(raw, method, msg_id)
-				else:
-					t = threading.Thread(target=self._forward_message, args=(raw, method, msg_id), daemon=True)
-					t.start()
-					threads.append(t)
-					threads = [th for th in threads if th.is_alive()]
-			for t in threads:
-				t.join(timeout=5.0)
-			return 0
-		finally:
-			self.close_session()
-
-
-def _run_daemon_status(runtime_dir: Optional[str] = None) -> int:
-	paths = _daemon_paths(runtime_dir=runtime_dir)
-	health = _probe_daemon_health(paths["sock_path"])
-	if health is None:
-		print(f"Daemon: stopped (socket: {paths['sock_path']})")
-		return 1
-	mode = oct(os.stat(paths["sock_path"]).st_mode & 0o777) if os.path.exists(paths["sock_path"]) else "?"
-	print(
-		f"Daemon: running (pid={health.get('pid')}, version={health.get('version')}, "
-		f"sessions={health.get('active_sessions', 0)}, in_flight={health.get('in_flight', 0)}, "
-		f"socket={paths['sock_path']} mode={mode})"
-	)
-	return 0
-
-
-def _run_daemon_stop(runtime_dir: Optional[str] = None) -> int:
-	paths = _daemon_paths(runtime_dir=runtime_dir)
-	if _probe_daemon_health(paths["sock_path"]) is None and not os.path.isfile(paths["meta_path"]):
-		print(f"Daemon: already stopped (socket: {paths['sock_path']})")
-		return 0
-	ok = _stop_daemon(paths["sock_path"], paths["meta_path"])
-	if ok:
-		print(f"Daemon: stopped (socket: {paths['sock_path']})")
-		return 0
-	print(f"Daemon: failed to stop cleanly (socket: {paths['sock_path']})", file=sys.stderr)
-	return 1
-
-
-def _run_stdio_proxy(runtime_dir: Optional[str] = None, idle_exit_s: int = DAEMON_DEFAULT_IDLE_EXIT) -> int:
-	def _ensure():
-		return _ensure_daemon_running(runtime_dir=runtime_dir, idle_exit_s=idle_exit_s)
-
-	sock_path = _ensure()
-	proxy = _StdioUdsProxy(sock_path, reconnect_fn=_ensure)
-	return proxy.run()
+from stealth_browser_cli import (
+	CDP_PORT,
+	CDP_URL,
+	DAEMON_DEFAULT_HTTP,
+	DAEMON_DEFAULT_IDLE_EXIT,
+	PROFILE_DIR,
+	PROTECTED_TOOLS,
+	TOOL_SECTIONS,
+	_HEAVY_CLI_FLAGS,
+	_StdioUdsProxy,
+	_UnixHTTPConnection,
+	_build_arg_parser,
+	_daemon_paths,
+	_disabled_sections_from_args,
+	_ensure_daemon_running,
+	_ensure_daemon_token,
+	_ensure_secure_runtime_dir,
+	_extract_mcp_payloads,
+	_format_sections_list,
+	_gating_notice,
+	_is_cli_fast_path as _cli_is_fast_path,
+	_parse_loopback_http,
+	_probe_daemon_health,
+	_resolve_disabled_tools,
+	_run_cli_fast_path,
+	_run_daemon_status,
+	_run_daemon_stop,
+	_run_stdio_proxy,
+	_script_sha256,
+	_server_script_path,
+	_stop_daemon,
+	_uds_request,
+)
 
 
 def _is_cli_fast_path() -> bool:
 	argv0 = os.path.basename(sys.argv[0]) if sys.argv else ""
 	if __name__ != "__main__" and argv0 not in ("stealth-browser", "stealth_browser.py"):
 		return False
-	return not any(arg in _HEAVY_CLI_FLAGS or arg.startswith("--http") for arg in sys.argv[1:])
+	return _cli_is_fast_path()
 
 
-def _run_cli_fast_path() -> int:
-	args = _build_arg_parser().parse_args()
-	if args.daemon_status:
-		return _run_daemon_status()
-	if args.daemon_stop:
-		return _run_daemon_stop()
-	def _handle_signal(_signum, _frame):
-		raise SystemExit(0)
-	for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-		signal.signal(sig, _handle_signal)
-	try:
-		return _run_stdio_proxy(idle_exit_s=args.daemon_idle_exit)
-	except (KeyboardInterrupt, SystemExit):
-		return 0
-
-
-# Fast-path exits before importing adblock/mcp/patchright so default stdio proxy stays lightweight.
+# Fast-path exits before importing adblock/mcp/patchright so legacy script invocation stays lightweight.
 if _is_cli_fast_path():
 	raise SystemExit(_run_cli_fast_path())
 
@@ -657,35 +198,75 @@ DIALOG_ACTION_TIMEOUT_S = 3.0
 MAX_DIALOG_HISTORY = 50
 
 TOOL_TOTAL_TIMEOUT_S = 60.0
+CDP_PROBE_STALE_S = 15.0
+CDP_PROBE_RETRY_SLEEP_S = 0.25
+_WRITE_PATH_TOOLS = frozenset({
+	"navigate",
+	"new_tab",
+	"click",
+	"type",
+	"press_key",
+	"scroll",
+	"batch",
+	"close_tab",
+	"evaluate_js",
+	"fetch",
+})
+_CACHED_READ_TOOLS = frozenset({"status", "downloads", "console_logs", "network_requests"})
 
 
 def _with_tool_deadline(fn):
 	@functools.wraps(fn)
 	async def wrapper(*args, **kwargs):
+		tool_name = fn.__name__
+		if tool_name in _WRITE_PATH_TOOLS and hasattr(session, "ensure_cdp_healthy"):
+			try:
+				await session.ensure_cdp_healthy()
+			except Exception:
+				pass
 		try:
-			return await asyncio.wait_for(fn(*args, **kwargs), timeout=TOOL_TOTAL_TIMEOUT_S)
+			result = await asyncio.wait_for(fn(*args, **kwargs), timeout=TOOL_TOTAL_TIMEOUT_S)
+			if tool_name not in _CACHED_READ_TOOLS and getattr(session, "_context", None) is not None:
+				if isinstance(result, str) and result.startswith("Error"):
+					if hasattr(session, "mark_cdp_error"):
+						session.mark_cdp_error()
+				elif hasattr(session, "mark_cdp_ok"):
+					session.mark_cdp_ok()
+			return result
 		except asyncio.TimeoutError:
+			if hasattr(session, "mark_cdp_error"):
+				session.mark_cdp_error()
 			try:
 				probe_ok = await asyncio.wait_for(asyncio.to_thread(session._probe_cdp_ready), timeout=2.0)
 			except Exception:
 				probe_ok = False
 			if not probe_ok:
-				try:
-					await asyncio.wait_for(session.close(), timeout=5.0)
-				except Exception:
-					pass
-				try:
-					await asyncio.wait_for(asyncio.to_thread(_force_kill_browser_processes), timeout=10.0)
-				except Exception:
-					pass
+				if hasattr(session, "_recover_wedged_cdp"):
+					try:
+						await session._recover_wedged_cdp()
+					except Exception:
+						pass
+				else:
+					try:
+						await asyncio.wait_for(session.close(), timeout=5.0)
+					except Exception:
+						pass
+					try:
+						await asyncio.wait_for(asyncio.to_thread(_force_kill_browser_processes), timeout=10.0)
+					except Exception:
+						pass
 				return (
-					f"Error {fn.__name__}: exceeded {int(TOOL_TOTAL_TIMEOUT_S)}s total; "
+					f"Error {tool_name}: exceeded {int(TOOL_TOTAL_TIMEOUT_S)}s total; "
 					f"CDP transport wedged — browser force-restarted, retry the call."
 				)
 			return (
-				f"Error {fn.__name__}: exceeded {int(TOOL_TOTAL_TIMEOUT_S)}s total; "
+				f"Error {tool_name}: exceeded {int(TOOL_TOTAL_TIMEOUT_S)}s total; "
 				f"browser still reachable — safe to retry; call restart_browser only if calls keep stalling."
 			)
+		except Exception:
+			if tool_name not in _CACHED_READ_TOOLS and hasattr(session, "mark_cdp_error"):
+				session.mark_cdp_error()
+			raise
 	return wrapper
 HEADLESS = os.environ.get("STEALTH_BROWSER_HEADLESS", "true").lower() in ("1", "true", "yes")
 CHROMIUM_APP_BIN = "/Applications/Chromium.app/Contents/MacOS/Chromium"
@@ -1481,6 +1062,79 @@ class BrowserSessionManager:
 		self._page_to_id: dict[Page, str] = {}
 		self._id_to_page: dict[str, Page] = {}
 		self._next_tab_seq: int = 1
+		self._last_cdp_ok_at: float = 0.0
+		self._last_cdp_error_at: float = 0.0
+		self._probe_task: Optional[asyncio.Task] = None
+		self._recovery_gen: int = 0
+
+	def mark_cdp_ok(self) -> None:
+		self._last_cdp_ok_at = time.monotonic()
+
+	def mark_cdp_error(self) -> None:
+		self._last_cdp_error_at = time.monotonic()
+
+	def _needs_cdp_probe(self) -> bool:
+		if self._context is None:
+			return False
+		if self._last_cdp_error_at > self._last_cdp_ok_at:
+			return True
+		if self._last_cdp_ok_at > 0.0 and (time.monotonic() - self._last_cdp_ok_at) >= CDP_PROBE_STALE_S:
+			return True
+		return False
+
+	async def _run_two_strike_probe(self) -> bool:
+		for attempt in range(2):
+			try:
+				ok = await asyncio.wait_for(asyncio.to_thread(self._probe_cdp_ready), timeout=2.0)
+			except Exception:
+				ok = False
+			if ok:
+				self.mark_cdp_ok()
+				return True
+			if attempt == 0:
+				await asyncio.sleep(CDP_PROBE_RETRY_SLEEP_S)
+		return False
+
+	async def _recover_wedged_cdp(self) -> bool:
+		gen_before = self._recovery_gen
+		async with self._lifecycle_lock:
+			if self._recovery_gen != gen_before:
+				return False
+			try:
+				if await asyncio.wait_for(asyncio.to_thread(self._probe_cdp_ready), timeout=2.0):
+					self.mark_cdp_ok()
+					return False
+			except Exception:
+				pass
+			try:
+				await asyncio.wait_for(self.close(), timeout=5.0)
+			except Exception:
+				pass
+			try:
+				await asyncio.wait_for(asyncio.to_thread(_force_kill_browser_processes), timeout=10.0)
+			except Exception:
+				pass
+			self._recovery_gen += 1
+			self._last_cdp_ok_at = 0.0
+			self._last_cdp_error_at = 0.0
+			return True
+
+	async def ensure_cdp_healthy(self) -> bool:
+		if not self._needs_cdp_probe():
+			return True
+		task = self._probe_task
+		if task is None or task.done():
+			task = asyncio.create_task(self._run_two_strike_probe())
+			self._probe_task = task
+		try:
+			ok = await asyncio.shield(task)
+		finally:
+			if self._probe_task is task and task.done():
+				self._probe_task = None
+		if not ok:
+			await self._recover_wedged_cdp()
+			return False
+		return True
 
 	@property
 	def _active_page(self) -> Optional[Page]:
@@ -1782,6 +1436,7 @@ class BrowserSessionManager:
 
 			ctx = await self._connect_cdp()
 			if ctx is not None:
+				self.mark_cdp_ok()
 				return ctx
 
 			os.makedirs(CACHE_DIR, exist_ok=True)
@@ -1791,10 +1446,12 @@ class BrowserSessionManager:
 				try:
 					ctx = await self._connect_cdp()
 					if ctx is not None:
+						self.mark_cdp_ok()
 						return ctx
 					await self._launch_detached_chromium()
 					ctx = await self._connect_cdp()
 					if ctx is not None:
+						self.mark_cdp_ok()
 						return ctx
 				finally:
 					fcntl.flock(lock_file, fcntl.LOCK_UN)
@@ -2521,7 +2178,11 @@ async def wait_for_human(
 			if session.headless:
 				token = _in_lifecycle_op.set(True)
 				try:
-					restart_res = await restart_browser(headless=False)
+					restart_res = await (
+						restart_browser(headless=False, ctx=ctx)
+						if ctx is not None
+						else restart_browser(headless=False)
+					)
 				finally:
 					_in_lifecycle_op.reset(token)
 				if isinstance(restart_res, str) and restart_res.startswith("Error"):
@@ -4065,7 +3726,7 @@ async def screenshot(
 			if annotate:
 				annotated_count = int(await asyncio.wait_for(page.evaluate(_JS_ANNOTATE_OVERLAY), timeout=10.0) or 0)
 				if annotated_count == 0:
-					await snapshot(tab=tab)
+					await (snapshot(tab=tab, ctx=ctx) if ctx is not None else snapshot(tab=tab))
 					annotated_count = int(await asyncio.wait_for(page.evaluate(_JS_ANNOTATE_OVERLAY), timeout=10.0) or 0)
 
 			if sel_clean or ref_clean:
@@ -5696,7 +5357,11 @@ async def set_headless(
 
 		token = _in_lifecycle_op.set(True)
 		try:
-			return await restart_browser(headless=headless)
+			return await (
+				restart_browser(headless=headless, ctx=ctx)
+				if ctx is not None
+				else restart_browser(headless=headless)
+			)
 		finally:
 			_in_lifecycle_op.reset(token)
 
@@ -5950,11 +5615,7 @@ def _serve_daemon(
 	rdir = paths["runtime_dir"]
 	sock_path = paths["sock_path"]
 	meta_path = paths["meta_path"]
-	os.makedirs(rdir, mode=0o700, exist_ok=True)
-	try:
-		os.chmod(rdir, 0o700)
-	except OSError:
-		pass
+	_ensure_secure_runtime_dir(rdir)
 
 	if _probe_daemon_health(sock_path, timeout=0.5) is not None:
 		print(f"Daemon already running at {sock_path}", file=sys.stderr)
@@ -6086,9 +5747,33 @@ def _serve_daemon(
 	return 0
 
 
+def _apply_tool_gating(
+	disabled_tools: frozenset[str],
+	gating_notice: str = "",
+	mcp_server: Optional[FastMCP] = None,
+) -> list[str]:
+	target = mcp if mcp_server is None else mcp_server
+	removed: list[str] = []
+	effective = frozenset(disabled_tools) - PROTECTED_TOOLS
+	for name in sorted(effective):
+		try:
+			target.remove_tool(name)
+			removed.append(name)
+		except Exception:
+			pass
+	if gating_notice:
+		existing = target._mcp_server.instructions or ""
+		if gating_notice not in existing:
+			target._mcp_server.instructions = f"{existing}\n{gating_notice}" if existing else gating_notice
+	return removed
+
+
 def main():
 	args = _build_arg_parser().parse_args()
 
+	if args.list_sections:
+		print(_format_sections_list())
+		raise SystemExit(0)
 	if args.install_browser:
 		raise SystemExit(_install_browser())
 	if args.doctor or args.smoke:
@@ -6097,10 +5782,32 @@ def main():
 		raise SystemExit(_run_daemon_status())
 	if args.daemon_stop:
 		raise SystemExit(_run_daemon_stop())
+
+	try:
+		disabled_tools, disabled_sections, effective_minimal = _resolve_disabled_tools(
+			minimal=args.minimal,
+			disabled_sections=_disabled_sections_from_args(args),
+		)
+	except ValueError as exc:
+		print(f"Error: {exc}", file=sys.stderr)
+		raise SystemExit(2)
+	notice = _gating_notice(effective_minimal, disabled_sections, disabled_tools)
+
 	if args.serve:
+		if disabled_tools:
+			_apply_tool_gating(disabled_tools, notice)
 		raise SystemExit(_serve_daemon(http_addr=args.http, idle_exit_s=args.daemon_idle_exit))
 	if not args.standalone:
-		raise SystemExit(_run_stdio_proxy(idle_exit_s=args.daemon_idle_exit))
+		raise SystemExit(
+			_run_stdio_proxy(
+				idle_exit_s=args.daemon_idle_exit,
+				disabled_tools=disabled_tools,
+				gating_notice=notice,
+			)
+		)
+
+	if disabled_tools:
+		_apply_tool_gating(disabled_tools, notice)
 
 	def _handle_signal(signum, _frame):
 		raise SystemExit(0)

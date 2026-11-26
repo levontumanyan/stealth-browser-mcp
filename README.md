@@ -95,6 +95,14 @@ By default, `stealth-browser` runs a lightweight stdlib stdio proxy that auto-st
 
 Headless by default; keep it that way and use `wait_for_human()` for interactive login/2FA/CAPTCHA.
 
+## Tool Gating (`--minimal` / `--disable-<section>`)
+
+Default exposes all 28 tools. To reduce schema context cost or restrict powerful tools per session (including over the shared daemon):
+
+- `stealth-browser --list-sections` — print all sections (`core`, `debug`, `network`, `lifecycle`), tool counts, and membership.
+- `stealth-browser --minimal` (or `STEALTH_BROWSER_MINIMAL=1`) — expose only the 16 `core` tools (`status` and `wait_for_human` are always protected in every mode).
+- `stealth-browser --disable-debug` / `--disable-network` / `--disable-lifecycle` (or `STEALTH_BROWSER_DISABLE_SECTIONS=debug,lifecycle`) — disable specific sections per session.
+
 # Trust model
 
 - **Transport & auth**: Default mode proxies stdio to a same-user `0600` Unix Domain Socket inside a `0700` runtime directory (`STEALTH_BROWSER_RUNTIME_DIR`, default `~/.cache/stealth-browser`). Optional `--serve --http [HOST:PORT]` binds loopback only, enforces a `Host` allowlist for DNS rebinding protection, and requires a `0600` Bearer token (`STEALTH_BROWSER_TOKEN_FILE`, default `~/.config/stealth-browser/daemon.token`). `--standalone` runs isolated in-process stdio with no socket or HTTP listener.

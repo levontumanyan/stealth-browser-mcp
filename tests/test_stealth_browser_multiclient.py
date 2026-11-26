@@ -358,3 +358,121 @@ def test_mcp_tool_schemas_hide_ctx_and_bind_context_kwarg():
 	for name in expected_ctx_tools:
 		assert name in registered
 		assert registered[name].context_kwarg == "ctx", f"tool {name} missing context_kwarg='ctx'"
+
+
+def test_screenshot_annotate_and_wait_for_human_forward_ctx(isolated_multiclient, monkeypatch, tmp_path):
+	async def _run():
+		p1 = FakePage("https://alpha.example", "Alpha")
+		p2 = FakePage("https://beta.example", "Beta")
+		mgr = isolated_multiclient([p1, p2], headless=True)
+
+		ctx_a = _make_http_ctx("client-a")
+		ctx_b = _make_http_ctx("client-b")
+		await sb.switch_tab(tab=0, ctx=ctx_a)
+		await sb.switch_tab(tab=1, ctx=ctx_b)
+
+		seen_snapshot_ctxs = []
+
+		async def _fake_snapshot(tab=-1, ctx=None, **kwargs):
+			seen_snapshot_ctxs.append((tab, ctx))
+			return "ok"
+
+		async def _fake_eval(script, arg=None, isolated_context=True):
+			return 0
+
+		async def _fake_screenshot(path="", full_page=False):
+			Path(path).write_bytes(b"png")
+
+		p2.evaluate = _fake_eval
+		p2.screenshot = _fake_screenshot
+		monkeypatch.setattr(sb, "snapshot", _fake_snapshot)
+
+		out = tmp_path / "shot.png"
+		res = await sb.screenshot(save_path=str(out), tab=-1, annotate=True, ctx=ctx_b)
+		assert "Screenshot saved" in res
+		assert seen_snapshot_ctxs == [(-1, ctx_b)]
+
+		seen_restart_client_keys = []
+
+		async def _fake_restart_inner(headless=None, url=None, client_key="default"):
+			seen_restart_client_keys.append(client_key)
+			mgr.headless = bool(headless) if headless is not None else mgr.headless
+			return "Browser restarted successfully in Headed mode on tab [0]"
+
+		monkeypatch.setattr(sb, "_restart_browser_inner", _fake_restart_inner)
+		p2.url = "https://beta.example/done"
+		wfh = await sb.wait_for_human(
+			reason="2FA",
+			url_contains="/done",
+			timeout_s=1,
+			poll_interval_s=0.01,
+			notify=False,
+			ctx=ctx_b,
+		)
+		assert "Human handoff completed" in wfh
+		assert seen_restart_client_keys == ["http:client-b"]
+
+	asyncio.run(_run())
+
+
+def test_proactive_cdp_health_probe_staleness_coalescing_and_recovery(isolated_multiclient, monkeypatch):
+	async def _run():
+		p1 = FakePage("https://ok.example", "OK")
+		mgr = isolated_multiclient([p1], headless=True)
+
+		probe_calls = 0
+		probe_results = [True]
+
+		def _fake_probe():
+			nonlocal probe_calls
+			probe_calls += 1
+			return probe_results[min(probe_calls - 1, len(probe_results) - 1)]
+
+		kill_calls = 0
+
+		def _fake_kill():
+			nonlocal kill_calls
+			kill_calls += 1
+
+		monkeypatch.setattr(mgr, "_probe_cdp_ready", _fake_probe)
+		monkeypatch.setattr(sb, "_force_kill_browser_processes", _fake_kill)
+		monkeypatch.setattr(sb, "CDP_PROBE_RETRY_SLEEP_S", 0.01)
+
+		mgr.mark_cdp_ok()
+		res_hot = await sb.evaluate_js(expression="1+1")
+		assert res_hot.startswith("Result:")
+		assert probe_calls == 0
+
+		mgr._last_cdp_ok_at -= (sb.CDP_PROBE_STALE_S + 5.0)
+		await sb.status()
+		assert probe_calls == 0
+
+		res_stale = await sb.evaluate_js(expression="1+1")
+		assert res_stale.startswith("Result:")
+		assert probe_calls == 1
+		assert kill_calls == 0
+
+		probe_calls = 0
+		probe_results = [False, False, False, False]
+		mgr.mark_cdp_error()
+		close_calls = 0
+		orig_close = mgr.close
+
+		async def _counted_close():
+			nonlocal close_calls
+			close_calls += 1
+			await orig_close()
+
+		monkeypatch.setattr(mgr, "close", _counted_close)
+
+		results = await asyncio.gather(
+			mgr.ensure_cdp_healthy(),
+			mgr.ensure_cdp_healthy(),
+			mgr.ensure_cdp_healthy(),
+		)
+		assert results == [False, False, False]
+		assert probe_calls <= 5
+		assert close_calls == 1
+		assert kill_calls == 1
+
+	asyncio.run(_run())
