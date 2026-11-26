@@ -376,6 +376,72 @@ MEDIA_FILE_EXTENSIONS = (
 	".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg",
 	".mp4", ".webm", ".ogg", ".woff", ".woff2", ".ttf", ".otf"
 )
+MEDIA_BLOCK_URL_PATTERNS = tuple(
+	pat for ext in MEDIA_FILE_EXTENSIONS for pat in (f"*{ext}", f"*{ext}?*")
+)
+MEDIA_FETCH_PATTERNS = (
+	{"resourceType": "Image"},
+	{"resourceType": "Media"},
+	{"resourceType": "Font"},
+)
+BLOCK_TRACKERS = os.environ.get("STEALTH_BROWSER_BLOCK_TRACKERS", "true").lower() in ("1", "true", "yes")
+TRACKER_BLOCK_URL_PATTERNS = (
+	"*://*.google-analytics.com/*",
+	"*://*.googletagmanager.com/*",
+	"*://*.doubleclick.net/*",
+	"*://*.googlesyndication.com/*",
+	"*://*.googleadservices.com/*",
+	"*://*.connect.facebook.net/*",
+	"*://*.facebook.com/tr*",
+	"*://*.hotjar.com/*",
+	"*://*.hotjar.io/*",
+	"*://*.segment.io/*",
+	"*://*.segment.com/*",
+	"*://*.amplitude.com/*",
+	"*://*.mixpanel.com/*",
+	"*://*.fullstory.com/*",
+	"*://*.clarity.ms/*",
+	"*://*.nr-data.net/*",
+	"*://*.newrelic.com/*",
+	"*://*.datadoghq-browser-agent.com/*",
+	"*://*.browser-intake-datadoghq.com/*",
+	"*://*.bugsnag.com/*",
+	"*://*.optimizely.com/*",
+	"*://*.hs-analytics.net/*",
+	"*://*.hs-scripts.com/*",
+	"*://*.hs-banner.com/*",
+	"*://*.ads-twitter.com/*",
+	"*://*.analytics.tiktok.com/*",
+	"*://*.bat.bing.com/*",
+	"*://*.criteo.com/*",
+	"*://*.criteo.net/*",
+	"*://*.taboola.com/*",
+	"*://*.outbrain.com/*",
+	"*://*.quantserve.com/*",
+	"*://*.scorecardresearch.com/*",
+	"*://*.adnxs.com/*",
+	"*://*.rubiconproject.com/*",
+	"*://*.pubmatic.com/*",
+	"*://*.openx.net/*",
+	"*://*.demdex.net/*",
+	"*://*.omtrdc.net/*",
+	"*://*.2o7.net/*",
+	"*://*.branch.io/*",
+	"*://*.braze.com/*",
+	"*://*.chartbeat.com/*",
+	"*://*.chartbeat.net/*",
+	"*://*.mouseflow.com/*",
+	"*://*.crazyegg.com/*",
+	"*://*.heapanalytics.com/*",
+	"*://*.pendo.io/*",
+	"*://*.adservice.google.com/*",
+	"*://*.amazon-adsystem.com/*",
+	"*://*.bing.com/bat.js*",
+	"*://*.linkedin.com/px/*",
+	"*://*.snap.licdn.com/*",
+	"*://*.pinterest.com/ct/*",
+	"*://*.ct.pinterest.com/*",
+)
 
 CACHE_DIR = os.path.expanduser("~/.cache/stealth-browser")
 CACHE_FILE = os.path.join(CACHE_DIR, "easyprivacy.txt")
@@ -660,6 +726,183 @@ async def _network_route_handler(route, request):
 				pass
 
 
+class NetworkBlockManager:
+	"""Applies per-page CDP media and tracker blocking without disabling Chromium's HTTP cache."""
+
+	def __init__(self, block_trackers: Optional[bool] = None):
+		self._block_trackers_override = block_trackers
+		self._sessions: dict[Page, Any] = {}
+		self._media_enabled: set[Page] = set()
+		self._pending_tasks: set[asyncio.Task] = set()
+
+	@property
+	def block_trackers(self) -> bool:
+		return BLOCK_TRACKERS if self._block_trackers_override is None else self._block_trackers_override
+
+	def _build_blocked_urls(self, block_media: bool) -> list[str]:
+		urls: list[str] = []
+		if self.block_trackers:
+			urls.extend(TRACKER_BLOCK_URL_PATTERNS)
+		if block_media:
+			urls.extend(MEDIA_BLOCK_URL_PATTERNS)
+		return urls
+
+	async def _fail_request(self, cdp: Any, request_id: str) -> None:
+		try:
+			await cdp.send("Fetch.failRequest", {"requestId": request_id, "errorReason": "BlockedByClient"})
+		except Exception:
+			pass
+
+	async def _ensure_session(self, page: Page) -> Any:
+		if page is None or page.is_closed():
+			return None
+		existing = self._sessions.get(page)
+		if existing is not None:
+			return existing
+		context = getattr(page, "context", None)
+		if context is None or not hasattr(context, "new_cdp_session"):
+			return None
+		try:
+			cdp = await asyncio.wait_for(context.new_cdp_session(page), timeout=CDP_OP_TIMEOUT_S)
+		except Exception:
+			return None
+		try:
+			await asyncio.wait_for(
+				cdp.send("Network.enable", {"maxTotalBufferSize": 0, "maxResourceBufferSize": 0}),
+				timeout=CDP_OP_TIMEOUT_S,
+			)
+		except Exception:
+			await self._detach_quiet(cdp)
+			return None
+
+		def _on_paused(ev: Any) -> None:
+			req_id = ev.get("requestId") if isinstance(ev, dict) else None
+			if not req_id:
+				return
+			try:
+				loop = asyncio.get_running_loop()
+			except RuntimeError:
+				return
+			task = loop.create_task(self._fail_request(cdp, req_id))
+			self._pending_tasks.add(task)
+			task.add_done_callback(self._pending_tasks.discard)
+
+		cdp.on("Fetch.requestPaused", _on_paused)
+		self._sessions[page] = cdp
+		if not getattr(page, "_network_blocker_close_hook", False):
+			setattr(page, "_network_blocker_close_hook", True)
+			page.on("close", lambda _=None, p=page: self._on_close(p))
+			page.on("crash", lambda _=None, p=page: self._on_crash(p))
+		return cdp
+
+	async def ensure_page(self, page: Page) -> bool:
+		if page is None:
+			return False
+		try:
+			if page.is_closed():
+				return False
+		except Exception:
+			return False
+		block_media = bool(getattr(page, "_media_blocked", False))
+		if not block_media and not self.block_trackers:
+			return False
+		if page in self._sessions and (page in self._media_enabled) == block_media:
+			return True
+		return await self.set_media_blocked(page, block_media)
+
+	async def set_media_blocked(self, page: Page, block_media: bool) -> bool:
+		if page is None:
+			return False
+		try:
+			if page.is_closed():
+				return False
+		except Exception:
+			return False
+
+		if not block_media and not self.block_trackers:
+			cdp = self._sessions.pop(page, None)
+			was_media = page in self._media_enabled
+			self._media_enabled.discard(page)
+			if cdp is not None:
+				if was_media:
+					try:
+						await asyncio.wait_for(cdp.send("Fetch.disable"), timeout=CDP_OP_TIMEOUT_S)
+					except Exception:
+						pass
+				try:
+					await asyncio.wait_for(cdp.send("Network.setBlockedURLs", {"urls": []}), timeout=CDP_OP_TIMEOUT_S)
+				except Exception:
+					pass
+				await self._detach_quiet(cdp)
+			return True
+
+		cdp = await self._ensure_session(page)
+		if cdp is None:
+			return False
+		urls = self._build_blocked_urls(block_media)
+		try:
+			await asyncio.wait_for(cdp.send("Network.setBlockedURLs", {"urls": urls}), timeout=CDP_OP_TIMEOUT_S)
+		except Exception:
+			return False
+		if block_media and page not in self._media_enabled:
+			try:
+				await asyncio.wait_for(
+					cdp.send("Fetch.enable", {"patterns": list(MEDIA_FETCH_PATTERNS)}),
+					timeout=CDP_OP_TIMEOUT_S,
+				)
+				self._media_enabled.add(page)
+			except Exception:
+				pass
+		elif not block_media and page in self._media_enabled:
+			try:
+				await asyncio.wait_for(cdp.send("Fetch.disable"), timeout=CDP_OP_TIMEOUT_S)
+			except Exception:
+				pass
+			self._media_enabled.discard(page)
+		return True
+
+	@staticmethod
+	async def _detach_quiet(cdp: Any) -> None:
+		try:
+			await asyncio.wait_for(cdp.detach(), timeout=CDP_OP_TIMEOUT_S)
+		except Exception:
+			pass
+
+	@staticmethod
+	def _schedule_detach(cdp: Any) -> None:
+		try:
+			asyncio.get_running_loop().create_task(NetworkBlockManager._detach_quiet(cdp))
+		except Exception:
+			pass
+
+	def _on_close(self, page: Page) -> None:
+		cdp = self._sessions.pop(page, None)
+		self._media_enabled.discard(page)
+		if cdp is not None:
+			self._schedule_detach(cdp)
+
+	def _on_crash(self, page: Page) -> None:
+		self._sessions.pop(page, None)
+		self._media_enabled.discard(page)
+
+	async def close_all(self) -> None:
+		tasks = list(self._pending_tasks)
+		self._pending_tasks.clear()
+		for task in tasks:
+			if not task.done():
+				task.cancel()
+		if tasks:
+			await asyncio.gather(*tasks, return_exceptions=True)
+		sessions = list(self._sessions.values())
+		self._sessions.clear()
+		self._media_enabled.clear()
+		if sessions:
+			await asyncio.gather(*(self._detach_quiet(cdp) for cdp in sessions), return_exceptions=True)
+
+
+network_blocker = NetworkBlockManager()
+
+
 class BrowserSessionManager:
 	"""Manages dedicated stealth Chromium browser or CDP connection for AI agents."""
 
@@ -703,6 +946,11 @@ class BrowserSessionManager:
 		if "keep_alive_mgr" in globals():
 			try:
 				await asyncio.wait_for(keep_alive_mgr.stop_all(), timeout=CDP_OP_TIMEOUT_S)
+			except Exception:
+				pass
+		if "network_blocker" in globals():
+			try:
+				await asyncio.wait_for(network_blocker.close_all(), timeout=CDP_OP_TIMEOUT_S)
 			except Exception:
 				pass
 		if (
@@ -954,16 +1202,9 @@ class BrowserSessionManager:
 					pass
 
 	async def _ensure_interceptor(self, context: BrowserContext):
-		_schedule_adblock_warmup()
 		await self._configure_native_downloads(context)
 		await self._ensure_animation_init_script(context)
-		if getattr(context, "_interceptor_attached", False):
-			return
 		setattr(context, "_interceptor_attached", True)
-		try:
-			await asyncio.wait_for(context.route("**/*", _network_route_handler), timeout=CDP_OP_TIMEOUT_S)
-		except Exception:
-			pass
 
 	async def _ensure_animation_init_script(self, context: BrowserContext) -> None:
 		"""Install the kill-stylesheet init script on a context when animations are frozen."""
@@ -1335,6 +1576,7 @@ keep_alive_mgr = KeepAliveManager()
 async def set_page_media_state(page: Page, block_media: bool):
 	"""Enable or disable media blocking on a given page."""
 	setattr(page, "_media_blocked", block_media)
+	await network_blocker.set_media_blocked(page, block_media)
 
 
 @mcp.tool()
@@ -1459,6 +1701,8 @@ async def navigate(
 
 		if block_media is not None:
 			await set_page_media_state(page, block_media=block_media)
+		else:
+			await network_blocker.ensure_page(page)
 
 		if not _has_explicit_scheme(url):
 			url = "https://" + url

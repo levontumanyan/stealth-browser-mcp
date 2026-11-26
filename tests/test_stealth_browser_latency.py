@@ -213,3 +213,142 @@ def test_snapshot_js_filters_before_visibility_and_caps_visible_iframe_poll():
 	assert "Date.now() + 400" in sb._SNAPSHOT_JS
 	assert "Date.now() + 1500" not in sb._SNAPSHOT_JS
 	assert "const candidates = [];" not in sb._SNAPSHOT_JS
+
+
+class FakeCDPSession:
+	def __init__(self):
+		self.calls: list[tuple[str, dict | None]] = []
+		self.listeners: dict[str, list] = {}
+		self.detached = False
+
+	def on(self, event: str, cb) -> None:
+		self.listeners.setdefault(event, []).append(cb)
+
+	def emit(self, event: str, payload: dict) -> None:
+		for cb in list(self.listeners.get(event, [])):
+			cb(payload)
+
+	async def send(self, method: str, params: dict | None = None):
+		self.calls.append((method, params))
+		return {}
+
+	async def detach(self):
+		self.detached = True
+
+
+class FakeCDPPage:
+	def __init__(self, cdp: FakeCDPSession):
+		self.url = "https://example.test/page"
+		self._closed = False
+		self._listeners: dict[str, list] = {}
+		self.context = MagicMock()
+		self.context.new_cdp_session = AsyncMock(return_value=cdp)
+
+	def is_closed(self) -> bool:
+		return self._closed
+
+	def on(self, event: str, cb) -> None:
+		self._listeners.setdefault(event, []).append(cb)
+
+	def emit(self, event: str) -> None:
+		for cb in list(self._listeners.get(event, [])):
+			cb(self)
+
+
+def test_ensure_interceptor_does_not_register_context_route():
+	async def _run():
+		mgr = sb.BrowserSessionManager("http://127.0.0.1:9222")
+		mgr._configure_native_downloads = AsyncMock()
+		mgr._ensure_animation_init_script = AsyncMock()
+		fake_ctx = MagicMock()
+		fake_ctx.route = AsyncMock()
+
+		await mgr._ensure_interceptor(fake_ctx)
+		fake_ctx.route.assert_not_awaited()
+		assert getattr(fake_ctx, "_interceptor_attached", False) is True
+
+	asyncio.run(_run())
+
+
+def test_network_blocker_media_toggle_fetch_fail_and_close_cleanup():
+	async def _run():
+		cdp = FakeCDPSession()
+		page = FakeCDPPage(cdp)
+		blocker = sb.NetworkBlockManager(block_trackers=True)
+
+		ok = await blocker.set_media_blocked(page, True)
+		assert ok is True
+		assert page in blocker._sessions
+		assert page in blocker._media_enabled
+		methods = [m for m, _ in cdp.calls]
+		assert methods == ["Network.enable", "Network.setBlockedURLs", "Fetch.enable"]
+		blocked_urls = cdp.calls[1][1]["urls"]
+		assert "*.png" in blocked_urls
+		assert "*.png?*" in blocked_urls
+		assert "*://*.google-analytics.com/*" in blocked_urls
+		assert cdp.calls[2][1]["patterns"] == list(sb.MEDIA_FETCH_PATTERNS)
+
+		cdp.emit("Fetch.requestPaused", {"requestId": "req-42"})
+		await asyncio.sleep(0)
+		await asyncio.sleep(0)
+		assert ("Fetch.failRequest", {"requestId": "req-42", "errorReason": "BlockedByClient"}) in cdp.calls
+		assert not blocker._pending_tasks
+
+		cdp.calls.clear()
+		ok2 = await blocker.set_media_blocked(page, False)
+		assert ok2 is True
+		assert page in blocker._sessions
+		assert page not in blocker._media_enabled
+		assert [m for m, _ in cdp.calls] == ["Network.setBlockedURLs", "Fetch.disable"]
+		urls_after = cdp.calls[0][1]["urls"]
+		assert "*.png" not in urls_after
+		assert "*://*.google-analytics.com/*" in urls_after
+
+		page.emit("close")
+		await asyncio.sleep(0)
+		await asyncio.sleep(0)
+		assert cdp.detached is True
+		assert page not in blocker._sessions
+
+	asyncio.run(_run())
+
+
+def test_network_blocker_zero_session_when_trackers_disabled():
+	async def _run():
+		cdp = FakeCDPSession()
+		page = FakeCDPPage(cdp)
+		blocker = sb.NetworkBlockManager(block_trackers=False)
+
+		assert await blocker.ensure_page(page) is False
+		page.context.new_cdp_session.assert_not_awaited()
+		assert page not in blocker._sessions
+
+		assert await blocker.set_media_blocked(page, True) is True
+		page.context.new_cdp_session.assert_awaited_once()
+		assert page in blocker._media_enabled
+
+		assert await blocker.set_media_blocked(page, False) is True
+		assert cdp.detached is True
+		assert page not in blocker._sessions
+		assert page not in blocker._media_enabled
+
+	asyncio.run(_run())
+
+
+def test_network_blocker_close_all_and_set_page_media_state(monkeypatch):
+	async def _run():
+		cdp = FakeCDPSession()
+		page = FakeCDPPage(cdp)
+		blocker = sb.NetworkBlockManager(block_trackers=True)
+		monkeypatch.setattr(sb, "network_blocker", blocker)
+
+		await sb.set_page_media_state(page, block_media=True)
+		assert getattr(page, "_media_blocked", False) is True
+		assert page in blocker._media_enabled
+
+		await blocker.close_all()
+		assert cdp.detached is True
+		assert not blocker._sessions
+		assert not blocker._media_enabled
+
+	asyncio.run(_run())
