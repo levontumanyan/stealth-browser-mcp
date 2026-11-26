@@ -11,5 +11,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
+      - name: Install dependencies
+        run: uv sync --locked
       - name: Run test suite
-        run: uv run --with pytest --with adblock --with 'mcp<2' --with patchright pytest tests/ -q
+        run: uv run pytest tests/ -q
+
+  package:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Build wheel
+        run: uv build --wheel --out-dir dist
+      - name: Install wheel as a tool
+        run: |
+          uv tool install --python 3.14 dist/stealthmcp-*.whl
+          stealth-browser --version
+          stealth-browser --doctor
