@@ -600,9 +600,10 @@ STEALTH_BROWSER_CHEATSHEET = (
 	"- navigate(url, block_media=None, new_tab=False, tab=-1, timeout_ms=30000, wait_until='domcontentloaded')\n"
 	"- wait_for(selector='', text='', url_contains='', state='visible', timeout_ms=15000, tab=-1)\n"
 	"- wait_for_human(reason='...', url_contains='', url_not_contains='', selector='', timeout_s=180, poll_interval_s=1.5, notify=True, tab=-1)\n"
-	"- snapshot(selector='body', max_elements=80, tab=-1, include_shadow=True, include_iframes=True, include_hrefs=False, filter='', viewport_only=False, max_length=8000)\n"
+	"- snapshot(selector='body', max_elements=80, tab=-1, include_shadow=True, include_iframes=True, include_hrefs=False, filter='', viewport_only=False, max_length=8000) — pass include_hrefs=True for link URLs\n"
 	"- get_content(selector='body', max_length=4000, interactive_only=False, clean=True, tab=-1, offset=0, filter='')\n"
 	"- extract(container_selector, fields={k:'text:.sel'|'@attr .sel'|'html:.sel'}, limit=20, include_shadow=True, include_iframes=True, tab=-1, max_length=8000)\n"
+	"  For form/input values: extract('#form', fields={'price': '@value #priceInput', 'agree': '@checked #agree'}) — do NOT use evaluate_js.\n"
 	"- click(selector='', ref='', text='', force=False, tab=-1, timeout_ms=5000)\n"
 	"- type(selector='', text='', clear_first=True, press_enter=False, tab=-1, timeout_ms=5000, ref='')\n"
 	"- press_key(key, tab=-1) | scroll(direction='down', amount=600, tab=-1) | screenshot(save_path='', tab=-1, full_page=False, selector='', ref='', annotate=False)\n"
@@ -611,7 +612,7 @@ STEALTH_BROWSER_CHEATSHEET = (
 	"- fetch(url, method='GET', headers=None, body=None, response_type='auto', tab=-1, timeout_ms=15000, save_path='', max_length=8000)\n"
 	"- state(framework='auto', selector='', tab=-1, max_length=8000) | set_media(enable_media=True, tab=-1) | set_animations(enabled=False, persist=True)\n"
 	"- downloads(limit=20, include_dir=False) | network_requests(url_filter='', resource_type='', content_type='', status_min=0, limit=30, clear=False, tab=-1, max_length=8000) | console_logs(level='', limit=50, clear=False, tab=-1, max_length=8000)\n"
-	"- keep_alive(enable=True, tab=-1, min_seconds=45, max_seconds=90, ping_url=None, click_selector=None) | set_headless(headless=True, force=False) | restart_browser(headless=None, url=None) | close_browser(force_kill=True)"
+	"- keep_alive(enable=True, tab=-1, min_seconds=45, max_seconds=90, ping_url=None, click_selector=None) | set_headless(headless=True, force=False) | restart_browser(headless=None, url=None, force=False) | close_browser(force_kill=True, force=False)"
 )
 
 mcp = FastMCP(
@@ -1254,6 +1255,7 @@ class NetworkBlockManager:
 		self._sessions: dict[Page, Any] = {}
 		self._media_enabled: set[Page] = set()
 		self._pending_tasks: set[asyncio.Task] = set()
+		self._inflight_pages: set[Page] = set()
 
 	@property
 	def block_trackers(self) -> bool:
@@ -1314,6 +1316,31 @@ class NetworkBlockManager:
 			page.on("close", lambda _=None, p=page: self._on_close(p))
 			page.on("crash", lambda _=None, p=page: self._on_crash(p))
 		return cdp
+
+	def schedule_ensure_page(self, page: Page) -> None:
+		if page is None or page in self._sessions or page in self._inflight_pages:
+			return
+		try:
+			if page.is_closed():
+				return
+		except Exception:
+			return
+		block_media = bool(getattr(page, "_media_blocked", False))
+		if not block_media and not self.block_trackers:
+			return
+		try:
+			loop = asyncio.get_running_loop()
+		except RuntimeError:
+			return
+		self._inflight_pages.add(page)
+		task = loop.create_task(self.ensure_page(page))
+		self._pending_tasks.add(task)
+
+		def _done(t: asyncio.Task, p: Page = page) -> None:
+			self._pending_tasks.discard(t)
+			self._inflight_pages.discard(p)
+
+		task.add_done_callback(_done)
 
 	async def ensure_page(self, page: Page) -> bool:
 		if page is None:
@@ -1416,6 +1443,7 @@ class NetworkBlockManager:
 		sessions = list(self._sessions.values())
 		self._sessions.clear()
 		self._media_enabled.clear()
+		self._inflight_pages.clear()
 		if sessions:
 			await asyncio.gather(*(self._detach_quiet(cdp) for cdp in sessions), return_exceptions=True)
 
@@ -1846,6 +1874,20 @@ class BrowserSessionManager:
 			self._configure_native_downloads(context),
 			self._ensure_animation_init_script(context),
 		)
+		if context is not None and not getattr(context, "_page_hook_attached", False) and hasattr(context, "on"):
+			setattr(context, "_page_hook_attached", True)
+
+			def _on_context_page(page: Page) -> None:
+				try:
+					self._register_page_listeners(page)
+					network_blocker.schedule_ensure_page(page)
+				except Exception:
+					pass
+
+			try:
+				context.on("page", _on_context_page)
+			except Exception:
+				pass
 		setattr(context, "_interceptor_attached", True)
 
 	async def _ensure_animation_init_script(self, context: BrowserContext) -> None:
@@ -1899,6 +1941,7 @@ class BrowserSessionManager:
 		page.on("dialog", _on_dialog)
 		download_tracker.attach(page)
 		telemetry_tracker.attach(page)
+		network_blocker.schedule_ensure_page(page)
 
 	def _unregister_page(self, page: Page) -> None:
 		tab_id = self._page_to_id.pop(page, None)
@@ -1939,6 +1982,55 @@ class BrowserSessionManager:
 			setattr(page, "_tab_id_close_attached", True)
 			page.on("close", lambda _=None, p=page: self._unregister_page(p))
 		return tab_id
+
+	def reassign_tab_id(self, page: Page, tab_id: str) -> None:
+		norm = str(tab_id).strip().lower()
+		if not norm:
+			return
+		old_id = self._page_to_id.get(page)
+		if old_id == norm and self._id_to_page.get(norm) is page:
+			return
+		if old_id is not None and self._id_to_page.get(old_id) is page:
+			self._id_to_page.pop(old_id, None)
+		prev_page = self._id_to_page.get(norm)
+		if prev_page is not None and prev_page is not page:
+			self._page_to_id.pop(prev_page, None)
+		self._page_to_id[page] = norm
+		self._id_to_page[norm] = page
+		match = re.match(r"^t(\d+)$", norm)
+		if match:
+			self._next_tab_seq = max(self._next_tab_seq, int(match.group(1)) + 1)
+		if not getattr(page, "_tab_id_close_attached", False):
+			setattr(page, "_tab_id_close_attached", True)
+			page.on("close", lambda _=None, p=page: self._unregister_page(p))
+
+	def _format_open_tabs_hint(self, pages: Optional[list[Page]] = None) -> str:
+		if pages is None:
+			ctx_pages = getattr(self._context, "pages", None) if self._context is not None else None
+			if isinstance(ctx_pages, (list, tuple)):
+				pages = []
+				for p in ctx_pages:
+					try:
+						if not p.is_closed():
+							pages.append(p)
+					except Exception:
+						continue
+			else:
+				pages = [p for p in self._id_to_page.values() if p is not None]
+		if not pages:
+			return ""
+		entries = []
+		for p in pages[:8]:
+			try:
+				tid = self.get_tab_id(p)
+				url = _truncate_url(getattr(p, "url", "") or "", 80)
+				entries.append(f"[{tid}] {url}")
+			except Exception:
+				continue
+		if not entries:
+			return ""
+		extra = f" (+{len(pages) - len(entries)} more)" if len(pages) > len(entries) else ""
+		return f" Open tabs: {', '.join(entries)}{extra}"
 
 	def set_active_page(self, page: Optional[Page], client_key: str = "default"):
 		if page is None:
@@ -2029,7 +2121,8 @@ class BrowserSessionManager:
 						self._unregister_page(page)
 						page = None
 				if page is None:
-					raise ValueError(f"Tab '{tab}' not found or was closed")
+					hint = self._format_open_tabs_hint()
+					raise ValueError(f"Tab '{tab}' not found or was closed.{hint}")
 				return page
 			try:
 				tab = int(tab_str)
@@ -2049,7 +2142,8 @@ class BrowserSessionManager:
 
 		pages = await self.get_pages()
 		if tab >= len(pages):
-			raise ValueError(f"Invalid tab index {tab}. Total open tabs: {len(pages)}")
+			hint = self._format_open_tabs_hint(pages)
+			raise ValueError(f"Invalid tab index {tab}. Total open tabs: {len(pages)}.{hint}")
 		return pages[tab]
 
 
@@ -2519,6 +2613,13 @@ async def wait_for_human(
 				pass
 
 			if session.headless:
+				prior_tabs: list[tuple[str, str, str]] = []
+				try:
+					for p in await asyncio.wait_for(session.get_pages(), timeout=CDP_OP_TIMEOUT_S):
+						p_url = getattr(p, "url", "") or ""
+						prior_tabs.append((session.get_tab_id(p), p_url, _url_origin(p_url)))
+				except Exception:
+					prior_tabs = [(tab_id, initial_url, _url_origin(initial_url))]
 				token = _in_lifecycle_op.set(True)
 				try:
 					restart_res = await restart_browser(headless=False)
@@ -2528,6 +2629,22 @@ async def wait_for_human(
 					return f"Error switching to headed mode for human handoff: {restart_res}"
 				switched_to_headed = True
 				pages = await asyncio.wait_for(session.get_pages(), timeout=CDP_OP_TIMEOUT_S)
+				used_pages: set[Page] = set()
+				for old_tid, old_url, old_origin in prior_tabs:
+					matched_page = None
+					if old_url and old_url != "about:blank" and not old_url.startswith("chrome://"):
+						for candidate in pages:
+							if candidate not in used_pages and (getattr(candidate, "url", "") or "") == old_url:
+								matched_page = candidate
+								break
+						if matched_page is None and old_origin:
+							for candidate in pages:
+								if candidate not in used_pages and (getattr(candidate, "url", "") or "").startswith(old_origin):
+									matched_page = candidate
+									break
+					if matched_page is not None:
+						used_pages.add(matched_page)
+						session.reassign_tab_id(matched_page, old_tid)
 				resolved_page = None
 				if initial_url and initial_url != "about:blank" and not initial_url.startswith("chrome://"):
 					for candidate in pages:
@@ -2542,6 +2659,7 @@ async def wait_for_human(
 									resolved_page = candidate
 									break
 				page = resolved_page if resolved_page is not None else await session.get_active_page(client_key=client_key)
+				session.reassign_tab_id(page, tab_id)
 				session.set_active_page(page, client_key=client_key)
 				tab_id = session.get_tab_id(page)
 			else:
@@ -3122,7 +3240,13 @@ _EXTRACT_JS = r"""({ containerSelector, fields, limit, includeShadow, includeIfr
 				if (spec.selector) el = c.querySelector(spec.selector);
 				if (el) {
 					if (spec.mode === 'attr') {
-						val = cap(el.getAttribute(spec.attr), TEXT_MAX);
+						if (spec.attr === 'value' && 'value' in el) {
+							val = cap(el.value !== undefined && el.value !== null ? el.value : el.getAttribute('value'), TEXT_MAX);
+						} else if (spec.attr === 'checked' && 'checked' in el) {
+							val = Boolean(el.checked);
+						} else {
+							val = cap(el.getAttribute(spec.attr), TEXT_MAX);
+						}
 					} else if (spec.mode === 'html') {
 						val = cap(el.outerHTML, HTML_MAX);
 					} else if (spec.mode === 'inner_html') {
@@ -3448,6 +3572,131 @@ def _format_snapshot_row(el: dict, fallback_idx: int, include_hrefs: bool = Fals
 	return " ".join(parts)
 
 
+_UNSET = object()
+_NAV_RETRY_MARKERS = (
+	"execution context was destroyed",
+	"cannot find context with specified id",
+	"execution context creation",
+	"most likely because of a navigation",
+)
+_OVERLAY_INTERCEPT_MARKER = "intercepts pointer events"
+_CLICK_OVERLAY_PHASE1_MS = 2000
+
+
+def _is_nav_context_error(exc: Exception) -> bool:
+	msg = str(exc).lower()
+	return any(marker in msg for marker in _NAV_RETRY_MARKERS)
+
+
+async def _wait_after_nav_error(page: Page, remaining_s: float) -> None:
+	if hasattr(page, "wait_for_load_state") and remaining_s > 0.5:
+		wait_ms = int(min(2000, max(200, (remaining_s - 0.3) * 1000)))
+		try:
+			await asyncio.wait_for(
+				page.wait_for_load_state("domcontentloaded", timeout=wait_ms),
+				timeout=(wait_ms / 1000.0) + 0.5,
+			)
+		except Exception:
+			pass
+	await asyncio.sleep(min(0.25, max(0.05, remaining_s * 0.25)))
+
+
+async def _evaluate_with_nav_retry(
+	page: Page,
+	expr: str,
+	arg: Any = _UNSET,
+	*,
+	timeout: float = 10.0,
+	isolated_context: Optional[bool] = None,
+	retries: int = 1,
+) -> Any:
+	deadline = time.monotonic() + timeout
+	kwargs: dict[str, Any] = {}
+	if isolated_context is not None:
+		kwargs["isolated_context"] = isolated_context
+	for attempt in range(retries + 1):
+		remaining = max(0.5, deadline - time.monotonic())
+		try:
+			coro = page.evaluate(expr, **kwargs) if arg is _UNSET else page.evaluate(expr, arg, **kwargs)
+			return await asyncio.wait_for(coro, timeout=remaining)
+		except Exception as exc:
+			rem = deadline - time.monotonic()
+			if attempt < retries and _is_nav_context_error(exc) and rem > 0.5:
+				await _wait_after_nav_error(page, rem)
+				continue
+			raise
+
+
+def _is_overlay_interception_error(exc: Exception) -> bool:
+	return _OVERLAY_INTERCEPT_MARKER in str(exc).lower()
+
+
+async def _js_click_locator(page: Page, locator: Any, ref_id: Optional[str], timeout_ms: int) -> bool:
+	js_timeout_ms = min(timeout_ms, _CLICK_OVERLAY_PHASE1_MS)
+	try:
+		await asyncio.wait_for(
+			locator.first.evaluate("el => el.click()", timeout=js_timeout_ms),
+			timeout=max(1.0, js_timeout_ms / 1000.0) + 1.0,
+		)
+		return True
+	except Exception:
+		if ref_id:
+			return await _js_click_ref(page, ref_id)
+		return False
+
+
+async def _click_locator_with_fallback(
+	page: Page,
+	locator: Any,
+	*,
+	ref_id: Optional[str],
+	matched: Optional[bool],
+	force: bool,
+	timeout_ms: int,
+) -> bool:
+	if force:
+		try:
+			try:
+				await asyncio.wait_for(
+					locator.first.evaluate("el => el.click()", timeout=timeout_ms),
+					timeout=max(1.0, timeout_ms / 1000.0) + 1.0,
+				)
+			except Exception:
+				await locator.click(timeout=timeout_ms, force=True)
+		except Exception:
+			if ref_id and await _js_click_ref(page, ref_id):
+				return False
+			raise
+		return False
+
+	first_timeout = _CLICK_OVERLAY_PHASE1_MS if timeout_ms > _CLICK_OVERLAY_PHASE1_MS else timeout_ms
+	remaining_timeout = timeout_ms - first_timeout
+	try:
+		await locator.click(timeout=first_timeout)
+		return False
+	except Exception as exc:
+		if _is_overlay_interception_error(exc):
+			if await _js_click_locator(page, locator, ref_id, timeout_ms):
+				return True
+			raise
+		if remaining_timeout > 0:
+			try:
+				await locator.click(timeout=remaining_timeout)
+				return False
+			except Exception as exc2:
+				if _is_overlay_interception_error(exc2):
+					if await _js_click_locator(page, locator, ref_id, timeout_ms):
+						return True
+					raise
+				exc = exc2
+		if ref_id:
+			if matched is None:
+				matched = await _locator_has_match(locator)
+			if not matched and await _js_click_ref(page, ref_id):
+				return False
+		raise exc
+
+
 @mcp.tool()
 @_with_tool_deadline
 async def snapshot(
@@ -3467,19 +3716,18 @@ async def snapshot(
 	try:
 		page = await _resolve_page(tab, ctx)
 		try:
-			raw = await asyncio.wait_for(
-				page.evaluate(
-					_SNAPSHOT_JS,
-					{
-						"targetSelector": selector,
-						"maxElements": max_elements,
-						"includeShadow": include_shadow,
-						"includeIframes": include_iframes,
-						"includeHrefs": include_hrefs,
-						"filter": filter,
-						"viewportOnly": viewport_only,
-					},
-				),
+			raw = await _evaluate_with_nav_retry(
+				page,
+				_SNAPSHOT_JS,
+				{
+					"targetSelector": selector,
+					"maxElements": max_elements,
+					"includeShadow": include_shadow,
+					"includeIframes": include_iframes,
+					"includeHrefs": include_hrefs,
+					"filter": filter,
+					"viewportOnly": viewport_only,
+				},
 				timeout=10.0,
 			)
 		except asyncio.TimeoutError:
@@ -3543,7 +3791,9 @@ async def batch(
 		before_url = getattr(page, "url", "") or ""
 		before_dialogs = len(getattr(page, "_dialog_history", None) or ())
 		results = []
+		current_step = 0
 		for idx, item in enumerate(actions):
+			current_step = idx
 			act = item.get("action", "").lower()
 			timeout = item.get("timeout_ms", 4000)
 			sel = (item.get("selector") or "").strip()
@@ -3556,28 +3806,15 @@ async def batch(
 					results.append(f"[{idx}] click: SKIPPED (missing 'selector', 'ref', or 'text')")
 					continue
 				loc, label, ref_id, matched = await _resolve_locator(page, selector=sel, ref=ref, text=text_target)
-				try:
-					if force:
-						try:
-							await asyncio.wait_for(
-								loc.first.evaluate("el => el.click()", timeout=timeout),
-								timeout=max(1.0, timeout / 1000.0) + 1.0,
-							)
-						except Exception:
-							await loc.click(timeout=timeout, force=True)
-					else:
-						await loc.click(timeout=timeout)
-				except Exception:
-					if ref_id:
-						if not force and matched is None:
-							matched = await _locator_has_match(loc)
-						if (not matched or force) and await _js_click_ref(page, ref_id):
-							pass
-						else:
-							raise
-					else:
-						raise
-				force_tag = " (force)" if force else ""
+				overlay_fallback = await _click_locator_with_fallback(
+					page,
+					loc,
+					ref_id=ref_id,
+					matched=matched,
+					force=force,
+					timeout_ms=timeout,
+				)
+				force_tag = " (force)" if force else (" (js-dispatched after overlay interception)" if overlay_fallback else "")
 				results.append(f"[{idx}] click {label}{force_tag}: OK")
 
 			elif act == "fill":
@@ -3673,7 +3910,13 @@ async def batch(
 		return _truncate_text(out, _BATCH_TOTAL_MAX_CHARS)
 	except Exception as exc:
 		elapsed = int((time.perf_counter() - t0) * 1000)
-		return f"Batch failed after {elapsed}ms: {_format_playwright_error(exc)}"
+		completed = len(results) if "results" in locals() else 0
+		step_idx = current_step if "current_step" in locals() else 0
+		total = len(actions)
+		msg = f"Batch failed at step [{step_idx}] ({completed}/{total} completed) after {elapsed}ms: {_format_playwright_error(exc)}"
+		if completed:
+			msg = f"{msg}\nCompleted:\n" + "\n".join(results)
+		return _truncate_text(msg, _BATCH_TOTAL_MAX_CHARS)
 
 
 _GET_CONTENT_CLEAN_JS = r"""({ sel }) => {
@@ -3767,8 +4010,12 @@ async def get_content(
 			return await snapshot(selector=selector, tab=tab, filter=filter, ctx=ctx)
 
 		page = await _resolve_page(tab, ctx)
+		is_body = selector.strip().lower() == "body"
 		if clean:
-			raw_text = await asyncio.wait_for(page.evaluate(_GET_CONTENT_CLEAN_JS, {"sel": selector}), timeout=10.0)
+			raw_text = await _evaluate_with_nav_retry(page, _GET_CONTENT_CLEAN_JS, {"sel": selector}, timeout=10.0)
+			if raw_text is None and is_body:
+				await _wait_after_nav_error(page, 2.5)
+				raw_text = await _evaluate_with_nav_retry(page, _GET_CONTENT_CLEAN_JS, {"sel": selector}, timeout=8.0)
 			if raw_text is None:
 				return f"Element '{selector}' not found on page {page.url}"
 			text = str(raw_text)
@@ -3776,10 +4023,22 @@ async def get_content(
 				text = "\n".join(re.sub(r"[ \t]+", " ", ln).strip() for ln in text.splitlines())
 				text = re.sub(r"\n{3,}", "\n\n", text).strip()
 		else:
-			element = page.locator(selector).first
-			if await element.count() == 0:
-				return f"Element '{selector}' not found on page {page.url}"
-			text = str(await asyncio.wait_for(element.inner_text(), timeout=10.0) or "").strip()
+			text = None
+			for attempt in range(2):
+				try:
+					element = page.locator(selector).first
+					if await element.count() == 0:
+						if attempt == 0 and is_body:
+							await _wait_after_nav_error(page, 2.5)
+							continue
+						return f"Element '{selector}' not found on page {page.url}"
+					text = str(await asyncio.wait_for(element.inner_text(), timeout=10.0) or "").strip()
+					break
+				except Exception as exc:
+					if attempt == 0 and _is_nav_context_error(exc):
+						await _wait_after_nav_error(page, 2.5)
+						continue
+					raise
 
 		if not text:
 			return "(Page element contains no visible text)"
@@ -3864,7 +4123,7 @@ async def extract(
 	max_length: int = _DEFAULT_OUTPUT_MAX_CHARS,
 	ctx: Optional[Context] = None,
 ) -> str:
-	"""Extract structured JSON rows from repeated containers (cards, tables) across DOM/Shadow/iframes. fields maps name -> 'text:.sel' | '@attr .sel' | 'html:.sel' | {selector, mode, attr} (max 12 fields, limit<=200)."""
+	"""Extract JSON rows from containers (cards/tables/forms) across DOM/Shadow/iframes. fields: name -> 'text:.sel'|'@attr .sel' ('@value'/'@checked' for inputs)|'html:.sel'|{selector,mode,attr}."""
 	t0 = time.perf_counter()
 	try:
 		normalized = _normalize_extract_fields(fields)
@@ -3872,24 +4131,23 @@ async def extract(
 			return (
 				"Error extracting rows: 'fields' must be a non-empty map of at most "
 				f"{_EXTRACT_MAX_FIELDS} field names to a spec string (e.g. '.title', 'text:.title', '@href a.link', "
-				"'html:.thumb') or {'selector': ..., 'mode': 'text'|'attr'|'html'|'inner_html', 'attr': ...}."
+				"'@value #price', 'html:.thumb') or {'selector': ..., 'mode': 'text'|'attr'|'html'|'inner_html', 'attr': ...}."
 			)
 		limit = min(max(1, int(limit)), _EXTRACT_MAX_LIMIT)
 		container_selector = (container_selector or "").strip()
 		if not container_selector:
 			return "Error extracting rows: 'container_selector' must be non-empty."
 		page = await _resolve_page(tab, ctx)
-		result = await asyncio.wait_for(
-			page.evaluate(
-				_EXTRACT_JS,
-				{
-					"containerSelector": container_selector,
-					"fields": normalized,
-					"limit": limit,
-					"includeShadow": include_shadow,
-					"includeIframes": include_iframes,
-				},
-			),
+		result = await _evaluate_with_nav_retry(
+			page,
+			_EXTRACT_JS,
+			{
+				"containerSelector": container_selector,
+				"fields": normalized,
+				"limit": limit,
+				"includeShadow": include_shadow,
+				"includeIframes": include_iframes,
+			},
 			timeout=15.0,
 		)
 		elapsed_ms = int((time.perf_counter() - t0) * 1000)
@@ -3930,28 +4188,15 @@ async def click(
 		before_url = getattr(page, "url", "") or ""
 		before_dialogs = len(getattr(page, "_dialog_history", None) or ())
 		locator, label, ref_id, matched = await _resolve_locator(page, selector=sel_clean, ref=ref_clean, text=text)
-		try:
-			if force:
-				try:
-					await asyncio.wait_for(
-						locator.first.evaluate("el => el.click()", timeout=timeout_ms),
-						timeout=max(1.0, timeout_ms / 1000.0) + 1.0,
-					)
-				except Exception:
-					await locator.click(timeout=timeout_ms, force=True)
-			else:
-				await locator.click(timeout=timeout_ms)
-		except Exception:
-			if ref_id:
-				if not force and matched is None:
-					matched = await _locator_has_match(locator)
-				if (not matched or force) and await _js_click_ref(page, ref_id):
-					pass
-				else:
-					raise
-			else:
-				raise
-		force_tag = " (force)" if force else ""
+		overlay_fallback = await _click_locator_with_fallback(
+			page,
+			locator,
+			ref_id=ref_id,
+			matched=matched,
+			force=force,
+			timeout_ms=timeout_ms,
+		)
+		force_tag = " (force)" if force else (" (js-dispatched after overlay interception)" if overlay_fallback else "")
 		delta = _action_delta_suffix(page, before_url, before_dialogs)
 		return f"Clicked element matching {label}{force_tag} on {page.url}{delta}"
 	except Exception as exc:
@@ -5102,16 +5347,15 @@ async def state(
 		}"""
 		try:
 			# Patchright defaults to an isolated world where window.__NEXT_DATA__/Redux/Fiber expandos are invisible
-			results = await asyncio.wait_for(
-				page.evaluate(
-					js_script,
-					{
-						"targetFramework": framework,
-						"selector": selector,
-					},
-					isolated_context=False,
-				),
+			results = await _evaluate_with_nav_retry(
+				page,
+				js_script,
+				{
+					"targetFramework": framework,
+					"selector": selector,
+				},
 				timeout=10.0,
+				isolated_context=False,
 			)
 		except asyncio.TimeoutError:
 			return f"Error detecting state: Timed out after 10000ms"
@@ -5341,10 +5585,12 @@ async def switch_tab(
 			norm = target.strip().lower()
 			resolved = next((i for i, p in enumerate(pages) if session.get_tab_id(p) == norm), -1)
 			if resolved < 0:
-				return f"No open tab with id '{norm}'. Use status() to list open tabs."
+				hint = session._format_open_tabs_hint(pages)
+				return f"No open tab with id '{norm}'.{hint or ' Use status() to list open tabs.'}"
 			target = resolved
 		if target < 0 or target >= len(pages):
-			return f"Invalid tab index {target}. Total open tabs: {len(pages)}"
+			hint = session._format_open_tabs_hint(pages)
+			return f"Invalid tab index {target}. Total open tabs: {len(pages)}.{hint}"
 
 		page = pages[target]
 		session.set_active_page(page, client_key=client_key)
@@ -5382,7 +5628,8 @@ async def close_tab(
 			norm = target.strip().lower()
 			resolved = next((i for i, p in enumerate(pages) if session.get_tab_id(p) == norm), -1)
 			if resolved < 0:
-				return f"No open tab with id '{norm}'. Use status() to list open tabs."
+				hint = session._format_open_tabs_hint(pages)
+				return f"No open tab with id '{norm}'.{hint or ' Use status() to list open tabs.'}"
 			target = resolved
 
 		if target == -1:
@@ -5394,7 +5641,8 @@ async def close_tab(
 			target_index = pages.index(page) if page in pages else -1
 		else:
 			if target < 0 or target >= len(pages):
-				return f"Invalid tab index {target}. Total open tabs: {len(pages)}"
+				hint = session._format_open_tabs_hint(pages)
+				return f"Invalid tab index {target}. Total open tabs: {len(pages)}.{hint}"
 			page = pages[target]
 			target_index = target
 

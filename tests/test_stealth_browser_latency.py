@@ -176,7 +176,7 @@ def test_click_and_type_ref_skip_count_on_single_frame_and_force_uses_single_eva
 		res_click = await sb.click(ref="e5")
 		assert "Clicked element matching ref 'e5'" in res_click
 		loc.count.assert_not_awaited()
-		loc.click.assert_awaited_once_with(timeout=5000)
+		loc.click.assert_awaited_once_with(timeout=2000)
 
 		res_force = await sb.click(ref="e5", force=True, timeout_ms=2500)
 		assert "Clicked element matching ref 'e5' (force)" in res_force

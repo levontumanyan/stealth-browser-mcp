@@ -476,7 +476,8 @@ def test_wait_for_human_switches_headless_to_headed_and_reresolves_tab(isolated_
 		assert reopened_p2.brought_to_front == 1
 		assert mgr._active_page is reopened_p2
 		new_id = mgr.get_tab_id(reopened_p2)
-		assert new_id != "t2"
+		assert new_id == "t2"
+		assert mgr.get_tab_id(reopened_p1) == "t1"
 		assert "Human handoff completed" in res
 		assert "(switched to headed mode)" in res
 		assert f"[tab_id={new_id}]" in res
