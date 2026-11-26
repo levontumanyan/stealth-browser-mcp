@@ -1173,19 +1173,35 @@ async def _apply_animations_to_page(page: Page) -> None:
 			setattr(page, "_animations_motion", motion)
 		except Exception:
 			pass
-	if not enabled:
+	if enabled:
+		setattr(page, "_animations_css_injected", False)
+	elif not getattr(page, "_animations_css_injected", False):
 		try:
 			await asyncio.wait_for(page.evaluate(_ANIMATIONS_INJECT_JS, _ANIMATIONS_KILL_CSS), timeout=CDP_OP_TIMEOUT_S)
+			setattr(page, "_animations_css_injected", True)
 		except Exception:
 			pass
 	if not getattr(page, "_animations_nav_hook", False):
 		setattr(page, "_animations_nav_hook", True)
-		page.on("domcontentloaded", lambda _=None, p=page: _schedule_animations_on_page(p))
+
+		def _on_dcl(_=None, p=page):
+			setattr(p, "_animations_css_injected", False)
+			_schedule_animations_on_page(p)
+
+		page.on("domcontentloaded", _on_dcl)
 
 
 def _schedule_animations_on_page(page: Page) -> None:
 	"""Schedule the per-page animation hook from sync page-listener code paths."""
-	if session.animations is None or page is None:
+	enabled = session.animations
+	if enabled is None or page is None:
+		return
+	motion = "no-preference" if enabled else "reduce"
+	if (
+		getattr(page, "_animations_motion", None) == motion
+		and getattr(page, "_animations_nav_hook", False)
+		and (enabled or getattr(page, "_animations_css_injected", False))
+	):
 		return
 	try:
 		asyncio.get_running_loop().create_task(_apply_animations_to_page(page))
@@ -1334,16 +1350,19 @@ async def status() -> str:
 		if session.animations is not None:
 			anim_state = "FROZEN" if session.animations is False else "ENABLED"
 			lines.append(f"Animations: {anim_state}")
-		for idx, page in enumerate(pages):
+		async def _safe_title(p: Page) -> str:
+			try:
+				return await asyncio.wait_for(p.title(), timeout=2.0)
+			except Exception:
+				return "(Unresponsive / Busy)"
+
+		titles = await asyncio.gather(*(_safe_title(p) for p in pages)) if pages else []
+		for idx, (page, title) in enumerate(zip(pages, titles)):
 			tab_id = session.get_tab_id(page)
 			active_marker = " (ACTIVE in this session)" if page == active_page else ""
 			media_status = " [TEXT-ONLY/MEDIA BLOCKED]" if getattr(page, "_media_blocked", False) else ""
 			animations_status = " [ANIMATIONS FROZEN]" if getattr(page, "_animations_motion", None) == "reduce" else ""
 			keep_alive_status = " [KEEP-ALIVE ACTIVE]" if keep_alive_mgr.is_active(page) else ""
-			try:
-				title = await asyncio.wait_for(page.title(), timeout=2.0)
-			except Exception:
-				title = "(Unresponsive / Busy)"
 			lines.append(f"\t[{idx} | {tab_id}] {title} - {page.url}{media_status}{animations_status}{keep_alive_status}{active_marker}")
 		dialog_lines = []
 		unhandled = getattr(session, "_unhandled_task_exceptions", None)
@@ -1918,7 +1937,7 @@ _SNAPSHOT_JS = r"""async ({ targetSelector, maxElements, includeShadow, includeI
 			seen.add(node);
 
 			try {
-				if (node.matches && node.matches(INTERACTIVE_SEL) && isVisible(node) && matchesFilter(node)) {
+				if (node.matches && node.matches(INTERACTIVE_SEL) && matchesFilter(node) && isVisible(node)) {
 					totalMatched++;
 					if (collected.length < limit) {
 						collected.push({ el: node, ctx });
@@ -1960,6 +1979,7 @@ _SNAPSHOT_JS = r"""async ({ targetSelector, maxElements, includeShadow, includeI
 
 	if (includeIframes) {
 		const frameNeedsLoad = (f) => {
+			if (!isVisible(f)) return false;
 			try {
 				const w = f.contentWindow;
 				if (!w) return false;
@@ -1977,9 +1997,9 @@ _SNAPSHOT_JS = r"""async ({ targetSelector, maxElements, includeShadow, includeI
 		};
 		const pendingFrames = () => [...document.querySelectorAll('iframe, frame')].filter(frameNeedsLoad);
 		let pending = pendingFrames();
-		const frameDeadline = Date.now() + 1500;
+		const frameDeadline = Date.now() + 400;
 		while (pending.length && Date.now() < frameDeadline) {
-			await new Promise((resolve) => setTimeout(resolve, 60));
+			await new Promise((resolve) => setTimeout(resolve, 50));
 			pending = pendingFrames();
 		}
 	}
@@ -2000,27 +2020,36 @@ _SNAPSHOT_JS = r"""async ({ targetSelector, maxElements, includeShadow, includeI
 		const refSel = `[data-sb-ref="${ref}"]`;
 		if (ctx.inShadow || ctx.inIframe) return refSel;
 
-		const candidates = [];
-		if (el.id) candidates.push(`#${escIdent(el.id)}`);
+		if (el.id) {
+			const idSel = `#${escIdent(el.id)}`;
+			if (isUnique(document, idSel, el)) return idSel;
+		}
 		const testid = el.getAttribute('data-testid');
-		if (testid) candidates.push(`[data-testid="${escAttr(testid)}"]`);
-		if (el.name) candidates.push(`${tag}[name="${escAttr(el.name)}"]`);
+		if (testid) {
+			const tidSel = `[data-testid="${escAttr(testid)}"]`;
+			if (isUnique(document, tidSel, el)) return tidSel;
+		}
+		if (el.name) {
+			const nameSel = `${tag}[name="${escAttr(el.name)}"]`;
+			if (isUnique(document, nameSel, el)) return nameSel;
+		}
 		const ariaLabel = el.getAttribute('aria-label');
 		if (ariaLabel && ariaLabel.length <= 60) {
-			candidates.push(`${tag}[aria-label="${escAttr(ariaLabel)}"]`);
+			const ariaSel = `${tag}[aria-label="${escAttr(ariaLabel)}"]`;
+			if (isUnique(document, ariaSel, el)) return ariaSel;
 		}
 		if (typeof el.className === 'string' && el.className.trim()) {
 			const classes = el.className.trim().split(/\s+/).filter((c) => c && !c.includes(':'));
 			for (const cls of classes.slice(0, 3)) {
-				candidates.push(`${tag}.${escIdent(cls)}`);
+				const clsSel = `${tag}.${escIdent(cls)}`;
+				if (isUnique(document, clsSel, el)) return clsSel;
 			}
 		}
-		if (el.type) candidates.push(`${tag}[type="${escAttr(el.type)}"]`);
-		candidates.push(tag);
-
-		for (const cand of candidates) {
-			if (isUnique(document, cand, el)) return cand;
+		if (el.type) {
+			const typeSel = `${tag}[type="${escAttr(el.type)}"]`;
+			if (isUnique(document, typeSel, el)) return typeSel;
 		}
+		if (isUnique(document, tag, el)) return tag;
 		return refSel;
 	};
 
@@ -2372,9 +2401,12 @@ async def _resolve_locator(page: Page, selector: str = "", ref: str = "", text: 
 		ref_sel = _ref_to_selector(ref_id)
 		label = f"ref '{ref_id}'" if ref else f"'{selector}'"
 		main_loc = page.locator(ref_sel)
+		secondary = _secondary_frames(page)
+		if not secondary:
+			return main_loc.first, label, ref_id, None
 		if await _locator_has_match(main_loc):
 			return main_loc.first, label, ref_id, True
-		for frame in _secondary_frames(page):
+		for frame in secondary:
 			try:
 				floc = frame.locator(ref_sel)
 				if await _locator_has_match(floc):
@@ -2567,18 +2599,22 @@ async def batch(actions: list[dict], tab: Union[int, str] = -1) -> str:
 				try:
 					if force:
 						try:
-							el = await asyncio.wait_for(loc.first.element_handle(), timeout=max(1.0, timeout / 1000.0))
-							if el is not None:
-								await el.evaluate("el => el.click()")
-							else:
-								await loc.click(timeout=timeout, force=True)
+							await asyncio.wait_for(
+								loc.first.evaluate("el => el.click()", timeout=timeout),
+								timeout=max(1.0, timeout / 1000.0) + 1.0,
+							)
 						except Exception:
 							await loc.click(timeout=timeout, force=True)
 					else:
 						await loc.click(timeout=timeout)
 				except Exception:
-					if ref_id and (not matched or force) and await _js_click_ref(page, ref_id):
-						pass
+					if ref_id:
+						if matched is None:
+							matched = await _locator_has_match(loc)
+						if (not matched or force) and await _js_click_ref(page, ref_id):
+							pass
+						else:
+							raise
 					else:
 						raise
 				force_tag = " (force)" if force else ""
@@ -2593,8 +2629,13 @@ async def batch(actions: list[dict], tab: Union[int, str] = -1) -> str:
 				try:
 					await loc.fill(text_val, timeout=timeout, force=force)
 				except Exception:
-					if ref_id and (not matched or force) and await _js_type_ref(page, ref_id, text_val, clear_first=True, press_enter=False):
-						pass
+					if ref_id:
+						if matched is None:
+							matched = await _locator_has_match(loc)
+						if (not matched or force) and await _js_type_ref(page, ref_id, text_val, clear_first=True, press_enter=False):
+							pass
+						else:
+							raise
 					else:
 						raise
 				results.append(f"[{idx}] fill {label}: OK")
@@ -2613,8 +2654,13 @@ async def batch(actions: list[dict], tab: Union[int, str] = -1) -> str:
 					if press_enter:
 						await loc.press("Enter")
 				except Exception:
-					if ref_id and (not matched or force) and await _js_type_ref(page, ref_id, text_val, clear_first=False, press_enter=press_enter):
-						pass
+					if ref_id:
+						if matched is None:
+							matched = await _locator_has_match(loc)
+						if (not matched or force) and await _js_type_ref(page, ref_id, text_val, clear_first=False, press_enter=press_enter):
+							pass
+						else:
+							raise
 					else:
 						raise
 				results.append(f"[{idx}] type {label} ({'with Enter' if press_enter else ''}): OK")
@@ -2672,7 +2718,7 @@ async def batch(actions: list[dict], tab: Union[int, str] = -1) -> str:
 
 _GET_CONTENT_CLEAN_JS = r"""({ sel }) => {
 	const el = document.querySelector(sel);
-	if (!el) return '';
+	if (!el) return null;
 	const JUNK_SEL = 'script, style, svg, noscript, nav, header, footer, [role="banner"], [role="navigation"], [aria-hidden="true"], .cookie-banner, .cookie-consent, #cookie-banner, .advertisement, .ad-banner';
 	const BLOCK_DISPLAY = new Set(['block', 'flex', 'grid', 'list-item', 'table', 'table-row', 'table-caption', 'flow-root']);
 	const parts = [];
@@ -2688,11 +2734,12 @@ _GET_CONTENT_CLEAN_JS = r"""({ sel }) => {
 			return;
 		}
 		if (node.nodeType !== 1) return;
+		let cs = null;
 		if (node !== el) {
 			if (node.hidden) return;
 			try { if (node.matches && node.matches(JUNK_SEL)) return; } catch (_) {}
 			try {
-				const cs = window.getComputedStyle(node);
+				cs = window.getComputedStyle(node);
 				if (!cs || cs.display === 'none' || cs.visibility === 'hidden') return;
 			} catch (_) {}
 		}
@@ -2701,11 +2748,10 @@ _GET_CONTENT_CLEAN_JS = r"""({ sel }) => {
 			parts.push('\n');
 			return;
 		}
-		let isBlock = false;
-		try {
-			const cs = window.getComputedStyle(node);
-			if (cs && BLOCK_DISPLAY.has(cs.display)) isBlock = true;
-		} catch (_) {}
+		if (cs === null) {
+			try { cs = window.getComputedStyle(node); } catch (_) {}
+		}
+		const isBlock = Boolean(cs && BLOCK_DISPLAY.has(cs.display));
 		if (isBlock && parts.length && !parts[parts.length - 1].endsWith('\n')) parts.push('\n');
 		for (const child of node.childNodes) walk(child);
 		if (isBlock && parts.length && !parts[parts.length - 1].endsWith('\n')) parts.push('\n');
@@ -2760,15 +2806,18 @@ async def get_content(
 			return await snapshot(selector=selector, tab=tab, filter=filter)
 
 		page = await session.resolve_page(tab)
-		element = page.locator(selector).first
-		if await element.count() == 0:
-			return f"Element '{selector}' not found on page {page.url}"
-
 		if clean:
-			text = await asyncio.wait_for(page.evaluate(_GET_CONTENT_CLEAN_JS, {"sel": selector}), timeout=10.0)
-			text = "\n".join(re.sub(r"[ \t]+", " ", ln).strip() for ln in str(text or "").splitlines())
-			text = re.sub(r"\n{3,}", "\n\n", text).strip()
+			raw_text = await asyncio.wait_for(page.evaluate(_GET_CONTENT_CLEAN_JS, {"sel": selector}), timeout=10.0)
+			if raw_text is None:
+				return f"Element '{selector}' not found on page {page.url}"
+			text = str(raw_text)
+			if "  " in text or "\t" in text or "\n\n\n" in text:
+				text = "\n".join(re.sub(r"[ \t]+", " ", ln).strip() for ln in text.splitlines())
+				text = re.sub(r"\n{3,}", "\n\n", text).strip()
 		else:
+			element = page.locator(selector).first
+			if await element.count() == 0:
+				return f"Element '{selector}' not found on page {page.url}"
 			text = str(await asyncio.wait_for(element.inner_text(), timeout=10.0) or "").strip()
 
 		if not text:
@@ -2921,18 +2970,22 @@ async def click(
 		try:
 			if force:
 				try:
-					el = await asyncio.wait_for(locator.first.element_handle(), timeout=max(1.0, timeout_ms / 1000.0))
-					if el is not None:
-						await el.evaluate("el => el.click()")
-					else:
-						await locator.click(timeout=timeout_ms, force=True)
+					await asyncio.wait_for(
+						locator.first.evaluate("el => el.click()", timeout=timeout_ms),
+						timeout=max(1.0, timeout_ms / 1000.0) + 1.0,
+					)
 				except Exception:
 					await locator.click(timeout=timeout_ms, force=True)
 			else:
 				await locator.click(timeout=timeout_ms)
 		except Exception:
-			if ref_id and (not matched or force) and await _js_click_ref(page, ref_id):
-				pass
+			if ref_id:
+				if matched is None:
+					matched = await _locator_has_match(locator)
+				if (not matched or force) and await _js_click_ref(page, ref_id):
+					pass
+				else:
+					raise
 			else:
 				raise
 		force_tag = " (force)" if force else ""
@@ -2972,8 +3025,13 @@ async def type(
 			if press_enter:
 				await locator.press("Enter")
 		except Exception:
-			if ref_id and not matched and await _js_type_ref(page, ref_id, text, clear_first=clear_first, press_enter=press_enter):
-				pass
+			if ref_id:
+				if matched is None:
+					matched = await _locator_has_match(locator)
+				if not matched and await _js_type_ref(page, ref_id, text, clear_first=clear_first, press_enter=press_enter):
+					pass
+				else:
+					raise
 			else:
 				raise
 
