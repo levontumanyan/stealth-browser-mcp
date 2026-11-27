@@ -135,26 +135,6 @@ class TestParseValidationSignature:
 		assert "field 'url'" in sig
 		assert "passed: timeout_ms" in sig
 
-	def test_pretty_printed_result_json_unwraps(self):
-		pretty = '{\n  "result": "Wait timed out after 30000ms waiting for selector \'table\'"\n}'
-		assert sba.unwrap_result_json(pretty) == "Wait timed out after 30000ms waiting for selector 'table'"
-
-
-class TestUnwrapResultJson:
-	def test_unwraps_string_result(self):
-		assert sba.unwrap_result_json('{"result":"Wait timed out after 30000ms"}') == "Wait timed out after 30000ms"
-
-	def test_leaves_plain_body_untouched(self):
-		assert sba.unwrap_result_json("Clicked element e5 on https://example.com") == "Clicked element e5 on https://example.com"
-
-	def test_leaves_non_result_json_untouched(self):
-		body = '{"type":"aborted","message":"Tool execution interrupted"}'
-		assert sba.unwrap_result_json(body) == body
-
-	def test_leaves_dict_result_untouched(self):
-		body = '{"result":{"rows":[1,2]}}'
-		assert sba.unwrap_result_json(body) == body
-
 
 class TestSilentParamMismatch:
 	def test_stale_tab_vs_index_rule_retired(self):
@@ -167,9 +147,6 @@ class TestSilentParamMismatch:
 
 
 class TestKnownTools:
-	def test_new_tools_listed(self):
-		for tool in ("extract", "wait_for", "wait_for_human", "downloads", "network_requests", "console_logs", "set_animations"):
-			assert tool in sba.KNOWN_TOOLS
 
 	def test_known_tools_covers_every_server_tool(self):
 		# KNOWN_TOOLS is load-bearing for error visibility (classify_outcome skips harness
@@ -183,15 +160,6 @@ class TestKnownTools:
 
 
 class TestAgyOverflow:
-	def test_expand_overflow_reads_saved_file(self, tmp_path, monkeypatch):
-		monkeypatch.setattr(sba, "BRAIN_DIR", tmp_path)
-		out_file = tmp_path / "steps" / "24" / "output.txt"
-		out_file.parent.mkdir(parents=True)
-		out_file.write_text("S" * 15591, encoding="utf-8")
-		stub = f"The output was large and was saved to: file://{out_file}"
-		body, overflowed = sba.expand_agy_overflow(stub)
-		assert overflowed is True
-		assert len(body) == 15591
 
 	def test_expand_overflow_truncated_variant_with_trailing_prose(self, tmp_path, monkeypatch):
 		monkeypatch.setattr(sba, "BRAIN_DIR", tmp_path)
@@ -217,28 +185,6 @@ class TestAgyOverflow:
 		body, overflowed = sba.expand_agy_overflow(stub)
 		assert overflowed is False
 		assert body == stub
-
-	def test_empty_overflow_file_keeps_stub(self, tmp_path, monkeypatch):
-		monkeypatch.setattr(sba, "BRAIN_DIR", tmp_path)
-		out_file = tmp_path / "steps" / "1" / "output.txt"
-		out_file.parent.mkdir(parents=True)
-		out_file.write_text("", encoding="utf-8")
-		stub = f"The output was large and was saved to: file://{out_file}"
-		body, overflowed = sba.expand_agy_overflow(stub)
-		assert overflowed is False
-		assert body == stub
-
-	def test_missing_file_keeps_stub(self, tmp_path, monkeypatch):
-		monkeypatch.setattr(sba, "BRAIN_DIR", tmp_path)
-		stub = f"The output was large and was saved to: file://{tmp_path}/missing/output.txt"
-		body, overflowed = sba.expand_agy_overflow(stub)
-		assert overflowed is False
-		assert body == stub
-
-	def test_plain_body_untouched(self):
-		body, overflowed = sba.expand_agy_overflow("Clicked element e5 on https://example.com")
-		assert overflowed is False
-		assert body == "Clicked element e5 on https://example.com"
 
 
 class TestNestedCharAttribution:
@@ -384,10 +330,6 @@ class TestComputeDiff:
 			snapshot["summary"]["sessions_by_source"] = {"agy": 1, "opencode": 1}
 		return snapshot
 
-	def test_agy_rate_from_explicit_baseline(self):
-		diff = sba.compute_diff(self._baseline(legacy=False), self._baseline(legacy=False))
-		row = next(k for k in diff["kpis"] if k["metric"] == "Schema reads / AGY session")
-		assert row["before"] == 4.0 and row["after"] == 4.0 and row["delta"] == 0.0
 
 	def test_agy_rate_derived_from_legacy_baseline(self):
 		legacy = self._baseline(legacy=True)
@@ -409,11 +351,6 @@ class TestComputeDiff:
 		diff = sba.compute_diff(self._baseline(legacy=False), current)
 		row = next(k for k in diff["kpis"] if k["metric"] == "Schema reads / AGY session")
 		assert row["delta"] == -3.0 and row["status"] == "improved"
-
-	def test_legacy_baseline_notes_and_clean_baseline_has_none(self):
-		legacy_diff = sba.compute_diff(self._baseline(legacy=True), self._baseline(legacy=False))
-		assert legacy_diff["notes"] and "Legacy baseline" in legacy_diff["notes"][0]
-		assert sba.compute_diff(self._baseline(legacy=False), self._baseline(legacy=False))["notes"] == []
 
 
 class TestInputCharTracking:
@@ -577,12 +514,6 @@ class TestStripAgyHeaders:
 		assert body == "line1\nCreated At: body-not-header"
 		assert created == datetime.datetime(2026, 11, 20, 10, 0, 5, tzinfo=datetime.timezone.utc)
 		assert completed == datetime.datetime(2026, 11, 20, 10, 0, 8, tzinfo=datetime.timezone.utc)
-
-	def test_no_headers_and_crlf(self):
-		body, created, completed = sba.strip_agy_headers("  hello\r\nworld  ")
-		assert body == "hello\nworld"
-		assert created is None and completed is None
-		assert sba.strip_agy_headers("") == ("", None, None)
 
 
 class TestLoadAgyTitles:

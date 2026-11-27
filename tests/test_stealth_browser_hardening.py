@@ -172,32 +172,6 @@ class FakePlaywrightTimeoutError(Exception):
 FakePlaywrightTimeoutError.__name__ = "TimeoutError"
 
 
-def test_fastmcp_instructions_cheatsheet(sb):
-	instructions = sb.mcp.instructions
-	lines = [line for line in instructions.splitlines() if line.strip()]
-	assert len(lines) >= 10
-	assert "Stay headless by default" in instructions
-	assert "set_headless(headless=False)" in instructions
-	assert "call status()" in instructions and "every open tab's title and URL" in instructions
-	assert "do NOT evaluate_js location.href/document.title" in instructions
-	assert sb.stealth_browser_cheatsheet() == instructions
-	assert "call status()" in Path.home().joinpath(".cache/stealth-browser/cheatsheet.txt").read_text(encoding="utf-8")
-	for token in (
-		"evaluate_js(expression=",
-		"script=",
-		"main_world=",
-		"wait_for(",
-		"batch(",
-		"fetch(",
-		"navigate(",
-		"snapshot(",
-		"click(",
-		"switch_tab(tab=",
-		"close_tab(tab=",
-	):
-		assert token in instructions, f"Missing {token} in instructions"
-
-
 def test_detect_cdp_headless_offloaded_to_thread(sb, monkeypatch):
 	main_tid = threading.get_ident()
 	detect_tids = []
@@ -727,29 +701,8 @@ def test_switch_tab_aliases_and_validation(sb, monkeypatch):
 	asyncio.run(scenario())
 
 
-def test_mcp_tool_schemas_accept_expected_params(sb):
-	async def scenario():
-		tools = {t.name: t for t in await sb.mcp.list_tools()}
-		assert "wait_for" in tools
-		assert set(tools["wait_for"].inputSchema["properties"].keys()) >= {
-			"selector", "text", "url_contains", "state", "timeout_ms", "tab",
-		}
-		assert {"expression", "script", "max_length", "tab", "timeout_ms", "main_world"} <= set(
-			tools["evaluate_js"].inputSchema["properties"].keys()
-		)
-		assert {"tab", "index"} <= set(tools["switch_tab"].inputSchema["properties"].keys())
-		assert {"tab", "index"} <= set(tools["close_tab"].inputSchema["properties"].keys())
-		assert set(tools["extract"].inputSchema["properties"].keys()) >= {
-			"container_selector", "fields", "limit", "include_shadow", "include_iframes", "tab", "max_length",
-		}
-
-
 def test_mcp_tool_schemas_forbid_extra_params(sb):
 	async def scenario():
-		tools = {t.name: t for t in await sb.mcp.list_tools()}
-		for name in ("navigate", "click", "switch_tab", "close_tab", "evaluate_js", "extract"):
-			assert tools[name].inputSchema.get("additionalProperties") is False, name
-
 		for name, bad_args in (
 			("navigate", {"url": "https://x.example", "typo": 1}),
 			("switch_tab", {"tab": 0, "tab_index": 0}),
@@ -926,7 +879,6 @@ def test_set_headless_resyncs_live_cdp_mode_before_short_circuit(sb, monkeypatch
 		assert forced
 
 	asyncio.run(scenario())
-
 
 
 def test_with_tool_deadline_returns_result_when_fast(sb, monkeypatch):

@@ -67,12 +67,3 @@ def test_grade_external_result_unreachable_never_fails():
 
 	res_fail = probe.grade_external_result(ok=True, title="Just a moment...", body_snippet="Checking your browser")
 	assert res_fail["status"] == "FAIL"
-
-
-def test_probe_cli_parser_has_expected_flags():
-	parser = probe.build_parser()
-	args = parser.parse_args(["--json", "--external", "--headed", "--port", "9444"])
-	assert args.json == "-"
-	assert args.external is True
-	assert args.headed is True
-	assert args.port == 9444

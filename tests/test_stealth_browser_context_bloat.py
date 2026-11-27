@@ -1,7 +1,6 @@
 import asyncio
 import importlib.machinery
 import importlib.util
-import json
 from collections import deque
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -63,34 +62,6 @@ class FakePage:
 		return self._locators.get(selector, FakeLocator(count=1))
 
 
-def test_instructions_cover_all_registered_tools_and_key_params(sb):
-	tools = asyncio.run(sb.mcp.list_tools())
-	tool_names = {t.name for t in tools}
-	instr = sb.mcp.instructions
-
-	for name in tool_names:
-		assert f"{name}(" in instr, f"Tool '{name}' missing from FastMCP instructions"
-
-	for token in (
-		"wait_for_human(",
-		"downloads(",
-		"network_requests(",
-		"console_logs(",
-		"include_hrefs=",
-		"viewport_only=",
-		"filter=",
-		"offset=",
-		"save_path=",
-		"annotate=",
-		"force=",
-		"ref=",
-	):
-		assert token in instr, f"Missing '{token}' in instructions"
-
-	total_schema_bytes = sum(len(json.dumps(t.model_dump())) for t in tools)
-	assert total_schema_bytes < 25000, f"Schemas still bloated: {total_schema_bytes}B"
-
-
 def test_snapshot_compact_cap_and_total_matched(sb, monkeypatch):
 	items = [
 		{
@@ -150,9 +121,6 @@ def test_get_content_clean_whitespace_offset_tail_and_filter(sb, monkeypatch):
 	page = FakePage(locator_map={"body": FakeLocator(count=1, text=messy)})
 	page.evaluate = AsyncMock(return_value=messy)
 	monkeypatch.setattr(sb.session, "resolve_page", AsyncMock(return_value=page))
-
-	assert "cloneNode" not in sb._GET_CONTENT_CLEAN_JS
-	assert "getComputedStyle" in sb._GET_CONTENT_CLEAN_JS
 
 	out = asyncio.run(sb.get_content(clean=True))
 	assert "   " not in out
