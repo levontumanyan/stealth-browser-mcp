@@ -135,7 +135,8 @@ STEALTH_BROWSER_CHEATSHEET = (
 	"Use this cheat-sheet instead of reading individual tool schemas; prefer snapshot(filter=...)/extract()/batch() over evaluate_js(). tab=-1 targets active tab (or index / stable 'tN').\n"
 	"Always call wait_for_human() (not set_headless churn) whenever a flow hits login/2FA/CAPTCHA/MFA.\n"
 	"- status() | new_tab(url='about:blank', block_media=None) | switch_tab(tab=0) | close_tab(tab=-1)\n"
-	"  For tab URLs/titles: call status() — it lists every open tab's title and URL in one call; do NOT evaluate_js location.href/document.title.\n"
+	"  For tab URLs/titles: call status() — it lists every open tab's title and URL as [index | id | name] in one call; do NOT evaluate_js location.href/document.title.\n"
+	"  Tab ids derive from the browser tab itself, so they are unique across concurrent agents; pass tab=<id> or tab=<name substring> on every call.\n"
 	"- navigate(url, block_media=None, new_tab=False, tab=-1, timeout_ms=30000, wait_until='domcontentloaded')\n"
 	"- wait_for(selector='', text='', url_contains='', state='visible', timeout_ms=15000, tab=-1)\n"
 	"- wait_for_human(reason='...', url_contains='', url_not_contains='', selector='', timeout_s=180, poll_interval_s=1.5, notify=True, tab=-1)\n"
@@ -898,6 +899,49 @@ async def _resolve_page(tab: Union[int, str] = -1, ctx: Optional[Context] = None
 	return await session.resolve_page(tab, client_key=client_key)
 
 
+def _tab_id_from_target(target_id: str) -> str:
+	return "t" + re.sub(r"[^0-9a-f]", "", target_id.lower())[:10]
+
+
+def _tab_name_from_title(title: str) -> str:
+	slug = re.sub(r"[^a-z0-9]+", "-", (title or "").lower()).strip("-")[:40]
+	return slug or "untitled"
+
+
+async def _cdp_target_id(page: Page) -> Optional[str]:
+	cached = getattr(page, "_stealth_target_id", None)
+	if isinstance(cached, str) and cached:
+		return cached
+	context = getattr(page, "context", None)
+	if context is None or not hasattr(context, "new_cdp_session"):
+		return None
+	try:
+		cdp = await asyncio.wait_for(context.new_cdp_session(page), timeout=CDP_OP_TIMEOUT_S)
+		info = await asyncio.wait_for(cdp.send("Target.getTargetInfo"), timeout=CDP_OP_TIMEOUT_S)
+		target_id = (info or {}).get("targetInfo", {}).get("targetId")
+		if isinstance(target_id, str) and target_id.strip():
+			value = target_id.strip()
+			setattr(page, "_stealth_target_id", value)
+			return value
+	except Exception:
+		pass
+	return None
+
+
+async def _resolve_tab_name(manager, pages: list[Page], name: str) -> int:
+	matched = -1
+	for idx, page in enumerate(pages):
+		try:
+			title = await asyncio.wait_for(page.title(), timeout=PAGE_TITLE_TIMEOUT_S)
+		except Exception:
+			continue
+		if _tab_name_from_title(title) == name or name in title.lower():
+			if matched >= 0:
+				return -1
+			matched = idx
+	return matched
+
+
 class BrowserSessionManager:
 	"""Manages dedicated stealth Chromium browser or CDP connection for AI agents."""
 
@@ -1457,14 +1501,35 @@ class BrowserSessionManager:
 		existing = self._page_to_id.get(page)
 		if existing is not None:
 			return existing
-		tab_id = f"t{self._next_tab_seq}"
-		self._next_tab_seq += 1
+		target_id = getattr(page, "_stealth_target_id", None)
+		if isinstance(target_id, str) and target_id:
+			tab_id = _tab_id_from_target(target_id)
+			previous = self._id_to_page.get(tab_id)
+			if previous is not None and previous is not page:
+				self._page_to_id.pop(previous, None)
+		else:
+			tab_id = f"t{self._next_tab_seq}"
+			self._next_tab_seq += 1
 		self._page_to_id[page] = tab_id
 		self._id_to_page[tab_id] = page
 		if not getattr(page, "_tab_id_close_attached", False):
 			setattr(page, "_tab_id_close_attached", True)
 			page.on("close", lambda _=None, p=page: self._unregister_page(p))
 		return tab_id
+
+	async def sync_tab_ids(self, pages: Optional[list[Page]] = None) -> None:
+		if pages is None:
+			if self._playwright is None:
+				return
+			try:
+				pages = await self.get_pages()
+			except Exception:
+				return
+		for page in pages:
+			if self._page_to_id.get(page) is not None:
+				continue
+			await _cdp_target_id(page)
+			self.get_tab_id(page)
 
 	def reassign_tab_id(self, page: Page, tab_id: str) -> None:
 		norm = str(tab_id).strip().lower()
@@ -1579,8 +1644,24 @@ class BrowserSessionManager:
 				return page
 			raise
 
+	async def _match_tab_name(self, name: str) -> Optional[Page]:
+		if self._playwright is None:
+			return None
+		matched = None
+		for candidate in await self.get_pages():
+			try:
+				title = await asyncio.wait_for(candidate.title(), timeout=PAGE_TITLE_TIMEOUT_S)
+			except Exception:
+				continue
+			if _tab_name_from_title(title) == name or name in title.lower():
+				if matched is not None:
+					return None
+				matched = candidate
+		return matched
+
 	async def resolve_page(self, tab: Union[int, str] = -1, client_key: str = "default") -> Page:
 		self._touch_activity()
+		await self.sync_tab_ids()
 		if isinstance(tab, str):
 			tab_str = tab.strip()
 			if tab_str.lower().startswith("t"):
@@ -1604,13 +1685,19 @@ class BrowserSessionManager:
 						self._unregister_page(page)
 						page = None
 				if page is None:
+					named = await self._match_tab_name(tab_key)
+					if named is not None:
+						return named
 					hint = self._format_open_tabs_hint()
 					raise ValueError(f"Tab '{tab}' not found or was closed.{hint}")
 				return page
+			named = await self._match_tab_name(tab_str.lower())
+			if named is not None:
+				return named
 			try:
 				tab = int(tab_str)
 			except ValueError as exc:
-				raise ValueError(f"Invalid tab identifier '{tab}'. Expected an integer index or tab ID like 't1'.") from exc
+				raise ValueError(f"Invalid tab identifier '{tab}'. Expected an integer index, browser-derived tab ID, or tab-name substring (see status).") from exc
 
 		if tab < 0:
 			active = self.get_active_page_for(client_key)
@@ -1832,6 +1919,7 @@ async def status(ctx: Optional[Context] = None) -> str:
 	try:
 		client_key = _session_key(ctx)
 		pages = await asyncio.wait_for(session.get_pages(), timeout=CDP_OP_TIMEOUT_S)
+		await session.sync_tab_ids(pages)
 		active_page = session.get_active_page_for(client_key)
 		mode_str = "Headless" if session.headless else "Headed"
 		lines = [f"Connected to browser session at {CDP_URL} (Mode: {mode_str})"]
@@ -1852,7 +1940,7 @@ async def status(ctx: Optional[Context] = None) -> str:
 			media_status = " [TEXT-ONLY/MEDIA BLOCKED]" if getattr(page, "_media_blocked", False) else ""
 			animations_status = " [ANIMATIONS FROZEN]" if getattr(page, "_animations_motion", None) == "reduce" else ""
 			keep_alive_status = " [KEEP-ALIVE ACTIVE]" if keep_alive_mgr.is_active(page) else ""
-			lines.append(f"\t[{idx} | {tab_id}] {title} - {page.url}{media_status}{animations_status}{keep_alive_status}{active_marker}")
+			lines.append(f"\t[{idx} | {tab_id} | {_tab_name_from_title(title)}] {title} - {page.url}{media_status}{animations_status}{keep_alive_status}{active_marker}")
 		dialog_lines = []
 		unhandled = getattr(session, "_unhandled_task_exceptions", None)
 		if unhandled is not None and unhandled.get("n"):
@@ -2033,9 +2121,14 @@ async def new_tab(
 			except Exception:
 				page = None
 	if page is not None and not page.is_closed():
+		await _cdp_target_id(page)
 		tab_id = session.get_tab_id(page)
+		try:
+			title = await asyncio.wait_for(page.title(), timeout=PAGE_TITLE_TIMEOUT_S)
+		except Exception:
+			title = ""
 		if f"tab_id={tab_id}" not in result:
-			return f"{result} (tab_id={tab_id})"
+			return f'{result} (tab_id={tab_id}) [name="{_tab_name_from_title(title)}"]'
 	return result
 
 
@@ -5061,19 +5154,22 @@ async def switch_tab(
 	index: Optional[int] = None,
 	ctx: Optional[Context] = None,
 ) -> str:
-	"""Switch focus to an open tab by numeric index or stable tab id like 't2' (see status). Accepts 'tab' or legacy alias 'index'."""
+	"""Switch tab by index, browser-derived id, or name substring (see status). Accepts 'tab'/'index'."""
 	target = tab if tab is not None else index
 	if target is None:
 		return "Error switching tab: provide a 'tab' (or 'index') value."
 	try:
 		client_key = _session_key(ctx)
 		pages = await asyncio.wait_for(session.get_pages(), timeout=CDP_OP_TIMEOUT_S)
+		await session.sync_tab_ids(pages)
 		if isinstance(target, str):
 			norm = target.strip().lower()
 			resolved = next((i for i, p in enumerate(pages) if session.get_tab_id(p) == norm), -1)
 			if resolved < 0:
+				resolved = await _resolve_tab_name(session, pages, norm)
+			if resolved < 0:
 				hint = session._format_open_tabs_hint(pages)
-				return f"No open tab with id '{norm}'.{hint or ' Use status() to list open tabs.'}"
+				return f"No open tab with id or name '{norm}'.{hint or ' Use status() to list open tabs.'}"
 			target = resolved
 		if target < 0 or target >= len(pages):
 			hint = session._format_open_tabs_hint(pages)
@@ -5100,7 +5196,7 @@ async def close_tab(
 	index: Optional[int] = None,
 	ctx: Optional[Context] = None,
 ) -> str:
-	"""Close a tab by numeric index or stable tab id like 't2' (-1 closes active tab, -99 or closing last tab terminates the browser window). Accepts 'tab' or legacy alias 'index'."""
+	"""Close tab by index, browser-derived id, or name substring (-1 active, -99 last). Accepts 'tab'/'index'."""
 	target = tab if tab is not None else (index if index is not None else -1)
 	try:
 		client_key = _session_key(ctx)
@@ -5108,6 +5204,7 @@ async def close_tab(
 			return await close_browser(ctx=ctx) if ctx is not None else await close_browser()
 
 		pages = await asyncio.wait_for(session.get_pages(), timeout=CDP_OP_TIMEOUT_S)
+		await session.sync_tab_ids(pages)
 		if not pages:
 			return await close_browser(ctx=ctx) if ctx is not None else await close_browser()
 
@@ -5115,8 +5212,10 @@ async def close_tab(
 			norm = target.strip().lower()
 			resolved = next((i for i, p in enumerate(pages) if session.get_tab_id(p) == norm), -1)
 			if resolved < 0:
+				resolved = await _resolve_tab_name(session, pages, norm)
+			if resolved < 0:
 				hint = session._format_open_tabs_hint(pages)
-				return f"No open tab with id '{norm}'.{hint or ' Use status() to list open tabs.'}"
+				return f"No open tab with id or name '{norm}'.{hint or ' Use status() to list open tabs.'}"
 			target = resolved
 
 		if target == -1:

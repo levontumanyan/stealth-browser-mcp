@@ -63,10 +63,10 @@ def test_status_fetches_tab_titles_in_parallel_preserving_order(monkeypatch):
 		assert elapsed < 0.25, f"Expected parallel title fetches (<0.25s), got {elapsed:.3f}s"
 		lines = [ln for ln in out.splitlines() if ln.startswith("\t[")]
 		assert len(lines) == 4
-		assert "[0 | t1] Alpha - https://a.example" in lines[0]
-		assert "[1 | t2] (Unresponsive / Busy) - https://b.example" in lines[1]
-		assert "[2 | t3] Gamma - https://c.example (ACTIVE in this session)" in lines[2]
-		assert "[3 | t4] Delta - https://d.example" in lines[3]
+		assert "[0 | t1 | alpha] Alpha - https://a.example" in lines[0]
+		assert "[1 | t2 | unresponsive-busy] (Unresponsive / Busy) - https://b.example" in lines[1]
+		assert "[2 | t3 | gamma] Gamma - https://c.example (ACTIVE in this session)" in lines[2]
+		assert "[3 | t4 | delta] Delta - https://d.example" in lines[3]
 
 	asyncio.run(_run())
 

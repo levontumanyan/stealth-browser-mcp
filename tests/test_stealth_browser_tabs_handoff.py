@@ -194,8 +194,8 @@ def test_switch_and_close_tab_accept_stable_tab_ids(isolated_session):
 		assert f"Switched to tab [1]: 'Tab B' (https://b.example)" in res
 		assert p2.brought_to_front == 1
 
-		assert f"No open tab with id 't99'" in await sb.switch_tab(tab="t99")
-		assert f"No open tab with id 't99'" in await sb.close_tab(tab="t99")
+		assert f"No open tab with id or name 't99'" in await sb.switch_tab(tab="t99")
+		assert f"No open tab with id or name 't99'" in await sb.close_tab(tab="t99")
 
 		res_close = await sb.close_tab(tab=id1)
 		assert f"Closed tab [0] ({id1}) (https://a.example). Remaining open tabs: 1" in res_close
@@ -256,12 +256,12 @@ def test_status_displays_stable_tab_ids(isolated_session):
 		mgr.set_active_page(p2)
 
 		out = await sb.status()
-		assert "[0 | t1] One - https://one.example" in out
-		assert "[1 | t2] Two - https://two.example (ACTIVE in this session)" in out
+		assert "[0 | t1 | one] One - https://one.example" in out
+		assert "[1 | t2 | two] Two - https://two.example (ACTIVE in this session)" in out
 
 		await p1.close()
 		out_after = await sb.status()
-		assert "[0 | t2] Two - https://two.example (ACTIVE in this session)" in out_after
+		assert "[0 | t2 | two] Two - https://two.example (ACTIVE in this session)" in out_after
 		assert "t1" not in out_after
 
 	asyncio.run(_run())
@@ -507,5 +507,34 @@ def test_wait_for_human_handles_tab_closed_mid_wait(isolated_session, monkeypatc
 		await driver
 
 		assert "tab t1 was closed" in res
+
+	asyncio.run(_run())
+
+
+def test_tab_ids_are_browser_derived_and_identical_across_sessions():
+	async def _run():
+		p1 = FakePage("https://a.example", "Tab A")
+		p2 = FakePage("https://b.example", "Tab B")
+		setattr(p1, "_stealth_target_id", "ABCDEF1234567890")
+		setattr(p2, "_stealth_target_id", "FEDCBA0987654321")
+		mgr1, _ = _make_session([p1, p2])
+		await mgr1.sync_tab_ids()
+		assert mgr1.get_tab_id(p1) == "tabcdef1234"
+		assert mgr1.get_tab_id(p2) == "tfedcba0987"
+		mgr2, _ = _make_session([p1, p2])
+		await mgr2.sync_tab_ids()
+		assert mgr2.get_tab_id(p1) == "tabcdef1234"
+		assert mgr2.get_tab_id(p2) == "tfedcba0987"
+
+	asyncio.run(_run())
+
+
+def test_resolve_page_by_tab_name(isolated_session):
+	async def _run():
+		p1 = FakePage("https://a.example", "Cerave Locion Hidratante")
+		p2 = FakePage("https://b.example", "Toleriane Dermallergo Fluido")
+		isolated_session([p1, p2])
+		assert await sb.session.resolve_page("cerave-locion-hidratante") is p1
+		assert await sb.session.resolve_page("toleriane") is p2
 
 	asyncio.run(_run())
