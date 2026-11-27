@@ -8,7 +8,7 @@
 # ///
 """FastMCP server providing browser automation tools over CDP / stealth Chromium using patchright."""
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 import os
 import sys

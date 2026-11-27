@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Lightweight stdlib-only CLI entrypoint and stdio-to-UDS proxy for stealth-browser."""
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 import argparse
 import fcntl

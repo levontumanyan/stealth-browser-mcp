@@ -36,7 +36,7 @@ jobs:
           names = zipfile.ZipFile(wheel).namelist()
           assert "stealth_browser.py" in names, names
           entry = next(n for n in names if n.endswith("entry_points.txt"))
-          assert "stealth-browser = stealth_browser:main" in zipfile.ZipFile(wheel).read(entry).decode(), entry
+          assert "stealth-browser = stealth_browser_cli:main" in zipfile.ZipFile(wheel).read(entry).decode(), entry
           print(f"Verified {wheel}")
           PY
       - name: Smoke-test built wheel
