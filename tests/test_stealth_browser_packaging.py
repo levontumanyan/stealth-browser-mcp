@@ -54,7 +54,7 @@ def test_cli_version_exits_zero():
 		timeout=60,
 	)
 	assert result.returncode == 0, result.stderr
-	assert "stealth-browser 0.1.0" in result.stdout
+	assert "stealth-browser 0.1.1" in result.stdout
 
 
 def test_cli_doctor_exits_zero():
