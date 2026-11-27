@@ -439,3 +439,50 @@ def test_proxy_handles_pre_init_probes_and_rewrites_server_error_id():
 	resp2 = json.loads(out.getvalue().decode("utf-8").strip())
 	assert resp2["id"] == 42
 	assert resp2["error"]["code"] == -32600
+
+
+def _load_cli():
+	loader = SourceFileLoader("stealth_browser_cli_test", str(ROOT / "bin" / "stealth_browser_cli.py"))
+	spec = spec_from_loader(loader.name, loader)
+	module = module_from_spec(spec)
+	loader.exec_module(module)
+	return module
+
+
+def test_kill_all_clears_browser_locks_and_state(monkeypatch, tmp_path, capsys):
+	cli = _load_cli()
+	profile = tmp_path / "prof"
+	profile.mkdir()
+	lock_names = ("SingletonLock", "SingletonCookie", "SingletonSocket")
+	for name in lock_names:
+		(profile / name).write_text("stale")
+	with _short_runtime_dir() as td:
+		runtime = Path(td)
+		state = runtime / f"state-{cli.CDP_PORT}.json"
+		launch = runtime / f"launch-{cli.CDP_PORT}.lock"
+		state.write_text("{}")
+		launch.write_text("")
+		monkeypatch.setattr(cli, "PROFILE_DIR", str(profile))
+		stopped = []
+		monkeypatch.setattr(cli, "_run_daemon_stop", lambda runtime_dir=None: stopped.append(runtime_dir) or 0)
+		monkeypatch.setattr(cli, "_browser_pids_for_profile", lambda prof: [])
+
+		assert cli._run_kill_all(runtime_dir=td) == 0
+		assert stopped == [td]
+		assert not any((profile / name).exists() for name in lock_names)
+		assert not state.exists() and not launch.exists()
+		assert "Killed 0 browser process(es)" in capsys.readouterr().out
+
+
+def test_browser_pids_for_profile_matches_only_that_profile(monkeypatch):
+	cli = _load_cli()
+
+	class Proc:
+		stdout = "\n".join([
+			"111 /Applications/Chromium.app/Contents/MacOS/Chromium --user-data-dir=/tmp/prof --remote-debugging-port=9222",
+			"112 /Applications/Chromium.app/Contents/Frameworks/Chromium Helper --user-data-dir=/tmp/prof",
+			"999 /Applications/Chromium.app/Contents/MacOS/Chromium --user-data-dir=/tmp/other",
+		])
+
+	monkeypatch.setattr(cli.subprocess, "run", lambda *args, **kwargs: Proc())
+	assert cli._browser_pids_for_profile("/tmp/prof") == [111, 112]

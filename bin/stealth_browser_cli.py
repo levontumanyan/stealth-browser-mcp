@@ -153,6 +153,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 	)
 	parser.add_argument("--daemon-status", action="store_true", help="Print shared daemon status and exit")
 	parser.add_argument("--daemon-stop", action="store_true", help="Stop the running shared daemon cleanly and exit")
+	parser.add_argument(
+		"--kill-all",
+		action="store_true",
+		help="Stop the daemon, kill all browser processes for this profile, and clear stale locks/state",
+	)
 	parser.add_argument("--standalone", action="store_true", help="Run direct in-process stdio MCP server instead of proxying to the shared daemon")
 	parser.add_argument("--list-sections", action="store_true", help="Print tool section names, counts, and membership and exit")
 	parser.add_argument("--minimal", action="store_true", help="Expose only the 16 core interaction tools (also via STEALTH_BROWSER_MINIMAL=1)")
@@ -720,6 +725,78 @@ def _run_daemon_stop(runtime_dir: Optional[str] = None) -> int:
 	return 1
 
 
+def _browser_pids_for_profile(profile_dir: str) -> list[int]:
+	markers = [f"--user-data-dir={profile_dir}", f"--user-data-dir={os.path.realpath(profile_dir)}"]
+	try:
+		proc = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True, timeout=10)
+	except Exception:
+		return []
+	pids: list[int] = []
+	for line in proc.stdout.splitlines():
+		line = line.strip()
+		if not any(marker in line for marker in markers):
+			continue
+		if "Chromium" not in line and "chrome" not in line.lower():
+			continue
+		fields = line.split(None, 1)
+		if not fields:
+			continue
+		try:
+			pid = int(fields[0])
+		except ValueError:
+			continue
+		if pid not in (os.getpid(), os.getppid()) and pid not in pids:
+			pids.append(pid)
+	return pids
+
+
+def _pid_alive(pid: int) -> bool:
+	try:
+		os.kill(pid, 0)
+		return True
+	except ProcessLookupError:
+		return False
+	except PermissionError:
+		return True
+
+
+def _run_kill_all(runtime_dir: Optional[str] = None) -> int:
+	paths = _daemon_paths(runtime_dir=runtime_dir)
+	profile_dir = os.path.expanduser(PROFILE_DIR)
+	_run_daemon_stop(runtime_dir=runtime_dir)
+	pids = _browser_pids_for_profile(profile_dir)
+	for pid in pids:
+		try:
+			os.kill(pid, signal.SIGTERM)
+		except OSError:
+			pass
+	remaining = [pid for pid in pids if _pid_alive(pid)]
+	deadline = time.monotonic() + 3.0
+	while remaining and time.monotonic() < deadline:
+		time.sleep(0.1)
+		remaining = [pid for pid in remaining if _pid_alive(pid)]
+	for pid in remaining:
+		try:
+			os.kill(pid, signal.SIGKILL)
+		except OSError:
+			pass
+	removed = 0
+	paths_to_clear = [os.path.join(profile_dir, name) for name in ("SingletonLock", "SingletonCookie", "SingletonSocket")]
+	paths_to_clear.extend([
+		os.path.join(paths["runtime_dir"], f"state-{CDP_PORT}.json"),
+		os.path.join(paths["runtime_dir"], f"launch-{CDP_PORT}.lock"),
+	])
+	for path in paths_to_clear:
+		if os.path.lexists(path):
+			try:
+				os.unlink(path)
+				removed += 1
+			except OSError:
+				pass
+	print(f"Killed {len(pids)} browser process(es); cleared {removed} lock/state file(s)")
+	return 0
+
+
 def _run_stdio_proxy(
 	runtime_dir: Optional[str] = None,
 	idle_exit_s: int = DAEMON_DEFAULT_IDLE_EXIT,
@@ -753,6 +830,8 @@ def _run_cli_fast_path() -> int:
 		return _run_daemon_status()
 	if args.daemon_stop:
 		return _run_daemon_stop()
+	if args.kill_all:
+		return _run_kill_all()
 	try:
 		disabled_tools, disabled_sections, effective_minimal = _resolve_disabled_tools(
 			minimal=args.minimal,
