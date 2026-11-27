@@ -91,9 +91,9 @@ By default, `stealth-browser` runs a lightweight stdlib stdio proxy that auto-st
 - `evaluate_js`: Execute JavaScript in the active page context.
 - `switch_tab` / `new_tab` / `close_tab`: Full multi-tab management (closing the last tab automatically closes the browser).
 - `close_browser`: Completely close the browser window, terminate the browser process, and release all resources.
-- `wait_for_human`: Pause for interactive login/2FA/CAPTCHA with a macOS notification; pin follow-up calls to the tab's stable `tN` id.
+- `wait_for_human`: Pause for interactive login/2FA/CAPTCHA with a macOS notification naming the tab (the browser never takes focus); pin follow-up calls to the tab's browser-derived id.
 
-Headless by default; keep it that way and use `wait_for_human()` for interactive login/2FA/CAPTCHA.
+Headed in the background by default — the window exists but never steals focus (launched via `open -g`); use `wait_for_human()` for interactive login/2FA/CAPTCHA.
 
 ## Tool Gating (`--minimal` / `--disable-<section>`)
 

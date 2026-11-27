@@ -159,6 +159,29 @@ class TestKnownTools:
 		)
 
 
+class TestShellCliStopFlags:
+	def test_kill_all_via_cli_script_recognized(self):
+		code = "uv run python bin/stealth_browser_cli.py --kill-all 2>&1 | tail -2"
+		assert sba.extract_nested_shell_calls(code) == [("cli:kill_all", {}, False)]
+
+	def test_daemon_stop_via_console_script_recognized(self):
+		assert sba.extract_nested_shell_calls("stealth-browser --daemon-stop") == [("cli:daemon_stop", {}, False)]
+
+	def test_daemon_stop_wins_when_both_flags_present(self):
+		code = "stealth-browser --kill-all --daemon-stop"
+		assert sba.extract_nested_shell_calls(code) == [("cli:daemon_stop", {}, False)]
+
+	def test_plain_invocation_stays_generic(self):
+		assert sba.extract_nested_shell_calls("uv run --script bin/stealth-browser status") == [("stdio", {}, False)]
+
+	def test_audit_script_not_mistaken_for_browser_cli(self):
+		assert sba.extract_nested_shell_calls("bin/stealth-browser-audit --json") == []
+
+	def test_stop_labels_are_known_tools(self):
+		assert "cli:kill_all" in sba.KNOWN_TOOLS
+		assert "cli:daemon_stop" in sba.KNOWN_TOOLS
+
+
 class TestAgyOverflow:
 
 	def test_expand_overflow_truncated_variant_with_trailing_prose(self, tmp_path, monkeypatch):

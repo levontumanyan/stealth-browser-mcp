@@ -44,7 +44,6 @@ class FakePage:
 		self._closed = False
 		self._listeners: dict[str, list] = {}
 		self._visible_selectors: set[str] = set()
-		self.brought_to_front = 0
 		self._context = context
 
 	def is_closed(self) -> bool:
@@ -65,9 +64,6 @@ class FakePage:
 
 	async def title(self) -> str:
 		return self._title
-
-	async def bring_to_front(self) -> None:
-		self.brought_to_front += 1
 
 	async def goto(self, url: str, timeout: int = 30000, wait_until: str = "domcontentloaded"):
 		self.url = url
@@ -192,7 +188,6 @@ def test_switch_and_close_tab_accept_stable_tab_ids(isolated_session):
 
 		res = await sb.switch_tab(tab=id2)
 		assert f"Switched to tab [1]: 'Tab B' (https://b.example)" in res
-		assert p2.brought_to_front == 1
 
 		assert f"No open tab with id or name 't99'" in await sb.switch_tab(tab="t99")
 		assert f"No open tab with id or name 't99'" in await sb.close_tab(tab="t99")
@@ -317,14 +312,14 @@ def test_wait_for_human_url_contains_and_osascript_notify(isolated_session, monk
 		assert "[tab_id=t1]" in res
 		assert "Title: 'Dashboard'" in res
 		assert "URL: https://app.example/dashboard" in res
-		assert p1.brought_to_front == 1
 
 		assert len(popen_calls) == 1
 		cmd, _ = popen_calls[0]
 		assert cmd[0] == "osascript"
 		assert cmd[1] == "-e"
 		assert 'Finish \\"2FA\\" login' in cmd[2]
-		assert 'with title "stealth-browser"' in cmd[2]
+		assert 'with title "stealth-browser: your input needed"' in cmd[2]
+		assert "on tab t1 'sign-in'" in cmd[2]
 
 	asyncio.run(_run())
 
@@ -473,7 +468,6 @@ def test_wait_for_human_switches_headless_to_headed_and_reresolves_tab(isolated_
 
 		assert restart_calls == [(False, None)]
 		assert mgr.headless is False
-		assert reopened_p2.brought_to_front == 1
 		assert mgr._active_page is reopened_p2
 		new_id = mgr.get_tab_id(reopened_p2)
 		assert new_id == "t2"

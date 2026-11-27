@@ -4,6 +4,7 @@ import fcntl
 import importlib.machinery
 import importlib.util
 import json
+import os
 import threading
 import time
 from collections import deque
@@ -71,7 +72,6 @@ class FakePage:
 		self.close_impl = None
 		self.evaluate_impl = None
 		self.evaluate_calls = []
-		self.bring_to_front_impl = None
 		self.wait_for_load_state_impl = None
 
 	def is_closed(self):
@@ -112,11 +112,6 @@ class FakePage:
 		self.evaluate_calls.append((expression, arg, isolated_context))
 		if self.evaluate_impl is not None:
 			return await self.evaluate_impl(expression, arg)
-		return None
-
-	async def bring_to_front(self):
-		if self.bring_to_front_impl is not None:
-			return await self.bring_to_front_impl()
 		return None
 
 	async def wait_for_load_state(self, state="domcontentloaded", timeout=5000):
@@ -239,6 +234,111 @@ def test_launch_detached_offloads_ext_and_cdp_probe(sb, monkeypatch, tmp_path):
 		assert "--load-extension=/tmp/fake-ext" in launched_cmd
 
 	asyncio.run(scenario())
+
+
+def test_headed_launch_uses_background_open_without_focus_steal(sb, monkeypatch, tmp_path):
+	monkeypatch.setattr(sb, "PROFILE_DIR", str(tmp_path / "profile"))
+	monkeypatch.setattr(sb, "CACHE_DIR", str(tmp_path / "cache"))
+	monkeypatch.setattr(sb, "_apple_passwords_ext_cache", "/tmp/fake-ext")
+	monkeypatch.setattr(sb, "BROWSER_EXECUTABLE", "/Applications/Chromium.app/Contents/MacOS/Chromium")
+	sb.session.headless = False
+
+	open_calls = []
+	popen_calls = []
+
+	def fake_run(cmd, **kwargs):
+		open_calls.append(cmd)
+		return MagicMock(returncode=0)
+
+	def fake_popen(cmd, **kwargs):
+		popen_calls.append(cmd)
+		return MagicMock()
+
+	monkeypatch.setattr(sb.session, "_probe_cdp_ready", lambda: True)
+	monkeypatch.setattr(sb.subprocess, "run", fake_run)
+	monkeypatch.setattr(sb.subprocess, "Popen", fake_popen)
+
+	async def scenario():
+		await sb.session._launch_detached_chromium()
+
+	asyncio.run(scenario())
+	assert not popen_calls
+	assert len(open_calls) == 1
+	cmd = open_calls[0]
+	assert cmd[:5] == ["open", "-g", "-n", "-a", "/Applications/Chromium.app"]
+	assert "--args" in cmd
+	assert "--headless=new" not in cmd
+	assert "--no-startup-window" in cmd
+	assert any(a.startswith("--remote-debugging-port=") for a in cmd)
+	assert "--load-extension=/tmp/fake-ext" in cmd
+
+
+def test_headed_launch_falls_back_to_popen_without_app_bundle(sb, monkeypatch, tmp_path):
+	monkeypatch.setattr(sb, "PROFILE_DIR", str(tmp_path / "profile"))
+	monkeypatch.setattr(sb, "CACHE_DIR", str(tmp_path / "cache"))
+	monkeypatch.setattr(sb, "_apple_passwords_ext_cache", "/tmp/fake-ext")
+	monkeypatch.setattr(sb, "BROWSER_EXECUTABLE", "/usr/bin/true")
+	sb.session.headless = False
+
+	launched_cmd = []
+	fake_proc = MagicMock()
+	fake_proc.poll.return_value = None
+
+	def fake_run(cmd, **kwargs):
+		raise AssertionError("open should not be used without an app bundle")
+
+	def fake_popen(cmd, **kwargs):
+		launched_cmd.extend(cmd)
+		return fake_proc
+
+	monkeypatch.setattr(sb.session, "_probe_cdp_ready", lambda: True)
+	monkeypatch.setattr(sb.subprocess, "run", fake_run)
+	monkeypatch.setattr(sb.subprocess, "Popen", fake_popen)
+
+	async def scenario():
+		await sb.session._launch_detached_chromium()
+
+	asyncio.run(scenario())
+	assert "--headless=new" not in launched_cmd
+	assert "--load-extension=/tmp/fake-ext" in launched_cmd
+
+
+def test_default_launch_mode_is_headed(sb):
+	assert "STEALTH_BROWSER_HEADLESS" not in os.environ
+	assert sb.HEADLESS is False
+
+
+def test_new_background_page_uses_cdp_without_activation(sb, monkeypatch):
+	original_browser = sb.session._browser
+
+	async def _run():
+		page = MagicMock()
+		context = MagicMock()
+		context.pages = []
+		context.new_page = AsyncMock(side_effect=AssertionError("plain new_page activates the window"))
+		cdp = MagicMock()
+
+		async def _create_target(method, params):
+			assert method == "Target.createTarget"
+			assert params == {"url": "about:blank", "background": True}
+			context.pages.append(page)
+			return {"targetId": "tid-1"}
+
+		cdp.send = AsyncMock(side_effect=_create_target)
+		cdp.detach = AsyncMock()
+		browser = MagicMock()
+		browser.new_browser_cdp_session = AsyncMock(return_value=cdp)
+		sb.session._browser = browser
+		monkeypatch.setattr(sb, "_cdp_target_id", AsyncMock(return_value="tid-1"))
+		result = await sb.session.new_background_page(context)
+		assert result is page
+		context.new_page.assert_not_awaited()
+		cdp.detach.assert_awaited_once()
+
+	try:
+		asyncio.run(_run())
+	finally:
+		sb.session._browser = original_browser
 
 
 def test_acquire_file_lock_times_out_when_contended(sb, tmp_path):
