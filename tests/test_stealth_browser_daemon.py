@@ -425,3 +425,40 @@ def test_proxy_dynamic_timeout_for_wait_for_human():
 		"tools/call",
 		{"method": "tools/call", "params": {"name": "wait_for_human", "arguments": {"timeout_s": 600}}},
 	) == 630.0
+
+
+def test_proxy_handles_pre_init_probes_and_rewrites_server_error_id():
+	import io
+
+	out = io.BytesIO()
+	proxy = sb._StdioUdsProxy("/tmp/nonexistent.sock", in_stream=io.BytesIO(), out_stream=out)
+	posted = []
+
+	def fake_post(body, sid, timeout=None):
+		posted.append((body, sid))
+		return 400, {"content-type": "application/json", "mcp-session-id": "bad-sid"}, json.dumps({
+			"jsonrpc": "2.0",
+			"id": "server-error",
+			"error": {"code": -32600, "message": "Bad Request"},
+		}).encode("utf-8")
+
+	proxy._post_mcp = fake_post
+
+	proxy._forward_message(b'{"jsonrpc":"2.0","method":"notifications/roots/list_changed"}', "notifications/roots/list_changed", None)
+	assert posted == []
+	assert out.getvalue() == b""
+
+	proxy._forward_message(b'{"jsonrpc":"2.0","id":1,"method":"server/discover"}', "server/discover", 1)
+	assert posted == []
+	resp = json.loads(out.getvalue().decode("utf-8").strip())
+	assert resp["id"] == 1
+	assert resp["error"]["code"] == -32601
+
+	out.seek(0)
+	out.truncate(0)
+	proxy.session_id = "valid-sid"
+	proxy._forward_message(b'{"jsonrpc":"2.0","id":42,"method":"tools/list"}', "tools/list", 42)
+	assert proxy.session_id == "valid-sid"
+	resp2 = json.loads(out.getvalue().decode("utf-8").strip())
+	assert resp2["id"] == 42
+	assert resp2["error"]["code"] == -32600

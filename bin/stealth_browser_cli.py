@@ -522,6 +522,18 @@ class _StdioUdsProxy:
 			self.out_stream.write(line)
 			self.out_stream.flush()
 
+	def _rewrite_error_id(self, payload: bytes, msg_id: Any) -> bytes:
+		if msg_id is None or b'"error"' not in payload:
+			return payload
+		try:
+			obj = json.loads(payload.decode("utf-8"))
+		except Exception:
+			return payload
+		if isinstance(obj, dict) and "error" in obj and obj.get("id") != msg_id:
+			obj["id"] = msg_id
+			return json.dumps(obj).encode("utf-8")
+		return payload
+
 	def _timeout_for_request(self, method: str, parsed: Any) -> float:
 		if method == "tools/call" and isinstance(parsed, dict):
 			params = parsed.get("params")
@@ -585,6 +597,16 @@ class _StdioUdsProxy:
 					self._write_line(err)
 				return
 
+		if method != "initialize" and self.session_id is None:
+			if msg_id is not None:
+				err = json.dumps({
+					"jsonrpc": "2.0",
+					"id": msg_id,
+					"error": {"code": -32601, "message": f"Method not found: {method}"},
+				}).encode("utf-8")
+				self._write_line(err)
+			return
+
 		req_timeout = self._timeout_for_request(method, parsed)
 		try:
 			status_code, resp_headers, data = self._post_mcp(raw, self.session_id, timeout=req_timeout)
@@ -611,7 +633,7 @@ class _StdioUdsProxy:
 			return
 
 		new_sid = resp_headers.get("mcp-session-id")
-		if new_sid:
+		if new_sid and 200 <= status_code < 300:
 			with self._state_lock:
 				self.session_id = new_sid
 
@@ -620,6 +642,7 @@ class _StdioUdsProxy:
 		payloads = _extract_mcp_payloads(resp_headers.get("content-type", ""), data)
 		if payloads:
 			for payload in payloads:
+				payload = self._rewrite_error_id(payload, msg_id)
 				self._write_line(self._filter_response_payload(payload, method))
 		elif status_code >= 400:
 			msg = data.decode("utf-8", errors="replace").strip() or f"HTTP {status_code}"
