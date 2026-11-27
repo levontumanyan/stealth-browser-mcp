@@ -13,7 +13,7 @@ Every tab opened in `stealth-browser` receives a monotonic stable ID (`t1`, `t2`
 2. Pin every subsequent call to that stable ID (`tab="t4"`):
    - `snapshot(tab="t4")` (optional `filter=...`, `viewport_only=True`), `extract(container_selector=..., fields={...}, tab="t4")`, `state(tab="t4")`, `batch(actions=[...], tab="t4")`, `fetch(url="/api/data", tab="t4")`, `get_content(tab="t4")` (optional `filter=...`, `offset=...`).
 3. Hand off interactive login, 2FA, or CAPTCHA cleanly when needed:
-   - `wait_for_human(reason="Approve 2FA prompt", url_contains="/dashboard", tab="t4")` switches headless Chromium to headed mode (with Apple Passwords enabled), sends a macOS notification, and resumes automatically once the condition matches.
+   - `wait_for_human(reason="Approve 2FA prompt", url_contains="/dashboard", tab="t4")` sends a macOS notification naming the tab (switching to headed only if the browser currently runs headless) and resumes automatically once the condition matches; the browser never takes focus.
 4. Clean up the owned tab before returning a concise summary to the parent:
    - Call `close_tab(tab="t4")` directly so background sessions do not accumulate.
 

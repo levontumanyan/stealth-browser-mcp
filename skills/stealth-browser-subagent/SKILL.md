@@ -27,9 +27,9 @@ Give the subagent a self-contained brief specifying:
 2. **Open and pin an owned tab**:
    - Call `new_tab(url="<target>", block_media=True)` (omit `block_media` when charts, images, or visual verification are needed).
    - Record the returned `tab_id=tN` and pass `tab="tN"` on every subsequent `stealth-browser` call. Never switch to or modify other open tabs.
-3. **Stay headless and hand off gates cleanly**:
-   - Keep Chromium headless by default; call `set_headless(headless=False)` only when explicitly asked.
-   - If login, 2FA, or CAPTCHA blocks progress, call `wait_for_human(reason="<action needed>", url_contains="<post-auth path>", tab="tN")` (or `selector=...` / `url_not_contains=...`). It switches to headed mode with Apple Passwords, notifies the user, and resumes once the condition matches.
+3. **Hand off gates cleanly without stealing focus**:
+   - Chromium runs headed in the background by default and never takes focus; never call `set_headless()` unless explicitly asked.
+   - If login, 2FA, or CAPTCHA blocks progress, call `wait_for_human(reason="<action needed>", url_contains="<post-auth path>", tab="tN")` (or `selector=...` / `url_not_contains=...`). It sends a macOS notification naming the tab (switching to headed only if the browser currently runs headless) and resumes once the condition matches.
 4. **Prefer structured, compact, low-roundtrip tools**:
    - `extract(container_selector=..., fields={...}, tab="tN")` for repeated cards, listings, table rows, or reading form input values (`fields={"price": "@value #priceInput"}`) instead of `evaluate_js`.
    - `state(tab="tN")` for Next.js, Nuxt, Redux, React Fiber, Vue, Apollo, or React Query in-memory stores.

@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 SCHEMA_VERSION = 1
-CACHE_SCHEMA_VERSION = 1
+CACHE_SCHEMA_VERSION = 2
 
 BRAIN_DIR = Path.home() / ".gemini" / "antigravity-cli" / "brain"
 SUMMARY_DB = Path.home() / ".gemini" / "antigravity-cli" / "conversation_summaries.db"
@@ -56,6 +56,8 @@ KNOWN_TOOLS = (
 	"downloads",
 	"network_requests",
 	"console_logs",
+	"cli:kill_all",
+	"cli:daemon_stop",
 )
 
 SOFT_OUTCOMES = frozenset({"set_headless_refused", "snapshot_empty", "state_empty"})
@@ -92,10 +94,12 @@ STEALTH_OPENCODE_RE = re.compile(
 	re.IGNORECASE,
 )
 NESTED_EXECUTE_RE = re.compile(r'tools\[\s*["\']stealth[-_]browser["\']\s*\]\.\s*([a-zA-Z0-9_]+)\s*\(')
+CLI_RUNNER_RE = r"(?:python\d*|uv\s+run\s+(?:--with\s+\S+\s+)*(?:python\d*|--script)?)"
 NESTED_SHELL_RE = re.compile(
-	r"(?:^|[;&|(]\s*|\n\s*|uv\s+run\s+(?:--with\s+\S+\s+)*--script\s+)(?:\S*/)?stealth[-_]browser(?![\w-])(?=$|[\s|&;])",
+	r"(?:^|[;&|(]\s*|\n\s*)(?:" + CLI_RUNNER_RE + r"\s+)?(?:\S*/)?stealth[-_]browser(?:_cli\.py)?(?![\w-])(?P<rest>[^\n;&|]*)",
 	re.MULTILINE,
 )
+CLI_STOP_FLAGS_RE = re.compile(r"--(kill-all|daemon-stop)\b", re.IGNORECASE)
 JSONRPC_TOOLS_CALL_RE = re.compile(r'"method"\s*:\s*"tools/call"')
 JSONRPC_TOOL_NAME_RE = re.compile(r'"name"\s*:\s*"([a-zA-Z0-9_]+)"')
 SNAPSHOT_ROW_RE = re.compile(r"\|\s*e?\d+\s*\|")
@@ -686,6 +690,15 @@ def extract_nested_shell_calls(code: str) -> list[tuple[str, dict[str, Any], boo
 		rpc_calls.append((tool, {}, False))
 	if rpc_calls:
 		return rpc_calls
+	stop_calls: list[tuple[str, dict[str, Any], bool]] = []
+	for m in NESTED_SHELL_RE.finditer(code):
+		flags = {flag.lower() for flag in CLI_STOP_FLAGS_RE.findall(m.group("rest"))}
+		if "daemon-stop" in flags:
+			stop_calls.append(("cli:daemon_stop", {}, False))
+		elif "kill-all" in flags:
+			stop_calls.append(("cli:kill_all", {}, False))
+	if stop_calls:
+		return stop_calls
 	if NESTED_SHELL_RE.search(code):
 		return [("stdio", {}, False)]
 	return []

@@ -131,7 +131,7 @@ async def _lifespan(_app):
 	yield
 
 STEALTH_BROWSER_CHEATSHEET = (
-	"Stay headless by default. Use wait_for_human() for interactive login/2FA/CAPTCHA (switches headed & polls); only call set_headless(headless=False) when asked.\n"
+	"The browser runs headed in the background by default and never steals focus. Use wait_for_human() for interactive login/2FA/CAPTCHA — it only sends a macOS notification naming the tab; never call set_headless() unless the user asks.\n"
 	"Use this cheat-sheet instead of reading individual tool schemas; prefer snapshot(filter=...)/extract()/batch() over evaluate_js(). tab=-1 targets active tab (or index / stable 'tN').\n"
 	"Always call wait_for_human() (not set_headless churn) whenever a flow hits login/2FA/CAPTCHA/MFA.\n"
 	"- status() | new_tab(url='about:blank', block_media=None) | switch_tab(tab=0) | close_tab(tab=-1)\n"
@@ -268,7 +268,7 @@ def _with_tool_deadline(fn):
 				session.mark_cdp_error()
 			raise
 	return wrapper
-HEADLESS = os.environ.get("STEALTH_BROWSER_HEADLESS", "true").lower() in ("1", "true", "yes")
+HEADLESS = os.environ.get("STEALTH_BROWSER_HEADLESS", "false").lower() in ("1", "true", "yes")
 CHROMIUM_APP_BIN = "/Applications/Chromium.app/Contents/MacOS/Chromium"
 DEFAULT_BROWSER_EXECUTABLE = CHROMIUM_APP_BIN if os.path.exists(CHROMIUM_APP_BIN) else None
 BROWSER_EXECUTABLE = os.environ.get("STEALTH_BROWSER_EXECUTABLE", DEFAULT_BROWSER_EXECUTABLE)
@@ -1247,7 +1247,7 @@ class BrowserSessionManager:
 			return False
 
 	async def _launch_detached_chromium(self) -> None:
-		"""Launch standalone Chromium detached from the MCP server process so it survives restarts."""
+		"""Launch standalone Chromium detached from the MCP server process so it survives restarts. Headed launches go through open -g so the window never takes focus."""
 		os.makedirs(PROFILE_DIR, exist_ok=True)
 
 		nm_hosts_dir = os.path.join(PROFILE_DIR, "NativeMessagingHosts")
@@ -1276,6 +1276,8 @@ class BrowserSessionManager:
 		]
 		if self.headless:
 			browser_args.append("--headless=new")
+		else:
+			browser_args.append("--no-startup-window")
 		apple_passwords_ext = _apple_passwords_ext_cache
 		if not apple_passwords_ext:
 			try:
@@ -1292,17 +1294,39 @@ class BrowserSessionManager:
 				f"--load-extension={apple_passwords_ext}",
 			])
 
-		proc = subprocess.Popen(
-			[executable, *browser_args],
-			stdin=subprocess.DEVNULL,
-			stdout=subprocess.DEVNULL,
-			stderr=subprocess.DEVNULL,
-			start_new_session=True,
-		)
+		proc: Optional[subprocess.Popen] = None
+		if self.headless:
+			proc = subprocess.Popen(
+				[executable, *browser_args],
+				stdin=subprocess.DEVNULL,
+				stdout=subprocess.DEVNULL,
+				stderr=subprocess.DEVNULL,
+				start_new_session=True,
+			)
+		else:
+			app_bundle = re.match(r"^(.*\.app)", executable)
+			if app_bundle:
+				launched = subprocess.run(
+					["open", "-g", "-n", "-a", app_bundle.group(1), "--args", *browser_args],
+					stdin=subprocess.DEVNULL,
+					stdout=subprocess.DEVNULL,
+					stderr=subprocess.DEVNULL,
+					timeout=10,
+				)
+				if launched.returncode != 0:
+					raise RuntimeError(f"Background headed launch failed for {app_bundle.group(1)} (exit {launched.returncode})")
+			else:
+				proc = subprocess.Popen(
+					[executable, *browser_args],
+					stdin=subprocess.DEVNULL,
+					stdout=subprocess.DEVNULL,
+					stderr=subprocess.DEVNULL,
+					start_new_session=True,
+				)
 
 		deadline = time.monotonic() + 5.0
 		while time.monotonic() < deadline:
-			if proc.poll() is not None:
+			if proc is not None and proc.poll() is not None:
 				raise RuntimeError(f"Detached Chromium exited early with code {proc.returncode}")
 			if await asyncio.to_thread(self._probe_cdp_ready):
 				return
@@ -1604,6 +1628,42 @@ class BrowserSessionManager:
 				continue
 		return open_pages
 
+	async def new_background_page(self, context: BrowserContext) -> Page:
+		"""Create a tab via CDP in the background so Chromium never activates its window."""
+		cdp = None
+		if self._browser is not None:
+			try:
+				existing = {id(p) for p in context.pages}
+				cdp = await asyncio.wait_for(
+					self._browser.new_browser_cdp_session(), timeout=CDP_OP_TIMEOUT_S
+				)
+				created = await asyncio.wait_for(
+					cdp.send("Target.createTarget", {"url": "about:blank", "background": True}),
+					timeout=CDP_OP_TIMEOUT_S,
+				)
+				target_id = created.get("targetId") if isinstance(created, dict) else None
+				deadline = time.monotonic() + NEW_PAGE_TIMEOUT_S
+				while time.monotonic() < deadline:
+					new_pages = [p for p in context.pages if id(p) not in existing]
+					for page in new_pages:
+						if not target_id:
+							return page
+						page_target = await asyncio.wait_for(
+							_cdp_target_id(page), timeout=CDP_OP_TIMEOUT_S
+						)
+						if page_target == target_id:
+							return page
+					await asyncio.sleep(0.05)
+			except Exception:
+				pass
+			finally:
+				if cdp is not None:
+					try:
+						await asyncio.wait_for(cdp.detach(), timeout=CDP_OP_TIMEOUT_S)
+					except Exception:
+						pass
+		return await asyncio.wait_for(context.new_page(), timeout=NEW_PAGE_TIMEOUT_S)
+
 	async def get_active_page(self, client_key: str = "default") -> Page:
 		self._touch_activity()
 		active = self.get_active_page_for(client_key)
@@ -1622,7 +1682,7 @@ class BrowserSessionManager:
 			elif pages:
 				page = pages[-1]
 			else:
-				page = await asyncio.wait_for(context.new_page(), timeout=NEW_PAGE_TIMEOUT_S)
+				page = await self.new_background_page(context)
 
 			await _apply_animations_to_page(page)
 			self.set_active_page(page, client_key=client_key)
@@ -1638,7 +1698,7 @@ class BrowserSessionManager:
 				elif pages:
 					page = pages[-1]
 				else:
-					page = await asyncio.wait_for(context.new_page(), timeout=NEW_PAGE_TIMEOUT_S)
+					page = await self.new_background_page(context)
 				await _apply_animations_to_page(page)
 				self.set_active_page(page, client_key=client_key)
 				return page
@@ -2033,7 +2093,7 @@ async def navigate(
 		client_key = _session_key(ctx)
 		context = await asyncio.wait_for(session.get_context(), timeout=GET_CONTEXT_TIMEOUT_S)
 		if new_tab:
-			page = await asyncio.wait_for(context.new_page(), timeout=NEW_PAGE_TIMEOUT_S)
+			page = await session.new_background_page(context)
 			await _apply_animations_to_page(page)
 			session.set_active_page(page, client_key=client_key)
 		else:
@@ -2136,10 +2196,13 @@ def _escape_applescript(text: str) -> str:
 	return text.replace("\\", "\\\\").replace('"', '\\"').replace("\r", " ").replace("\n", " ")
 
 
-def _notify_human(reason: str) -> Optional[subprocess.Popen]:
+def _notify_human(reason: str, tab_id: str = "", tab_title: str = "") -> Optional[subprocess.Popen]:
 	try:
 		safe_msg = _escape_applescript(reason)
-		script = f'display notification "{safe_msg}" with title "stealth-browser"'
+		if tab_id:
+			name = _tab_name_from_title(tab_title) if tab_title else ""
+			safe_msg = f"{safe_msg} on tab {tab_id}" + (f" '{_escape_applescript(name)}'" if name else "")
+		script = f'display notification "{safe_msg}" with title "stealth-browser: your input needed"'
 		return subprocess.Popen(
 			["osascript", "-e", script],
 			stdin=subprocess.DEVNULL,
@@ -2167,7 +2230,7 @@ async def wait_for_human(
 	tab: Union[int, str] = -1,
 	ctx: Optional[Context] = None,
 ) -> str:
-	"""Hand off a tab to the human for login/2FA/CAPTCHA (switches to headed mode if needed, sends optional macOS notification) and poll until url_contains, url_not_contains, selector visible, or URL change."""
+	"""Hand off a tab to the human for login/2FA/CAPTCHA without stealing focus: sends an optional macOS notification naming the tab and polls until url_contains, url_not_contains, selector visible, or URL change (switches to headed mode only if the browser currently runs headless)."""
 	t0 = time.monotonic()
 	notify_proc: Optional[subprocess.Popen] = None
 	try:
@@ -2245,13 +2308,12 @@ async def wait_for_human(
 			else:
 				session.set_active_page(page, client_key=client_key)
 
-		try:
-			await page.bring_to_front()
-		except Exception:
-			pass
-
 		if notify:
-			notify_proc = _notify_human(reason)
+			try:
+				notify_title = await asyncio.wait_for(page.title(), timeout=2.0)
+			except Exception:
+				notify_title = ""
+			notify_proc = _notify_human(reason, tab_id=tab_id, tab_title=notify_title)
 
 		has_explicit_condition = bool(url_contains or url_not_contains or selector)
 		interval = max(0.005, float(poll_interval_s))
@@ -5177,7 +5239,6 @@ async def switch_tab(
 
 		page = pages[target]
 		session.set_active_page(page, client_key=client_key)
-		await asyncio.wait_for(page.bring_to_front(), timeout=CDP_OP_TIMEOUT_S)
 		try:
 			title = await asyncio.wait_for(page.title(), timeout=PAGE_TITLE_TIMEOUT_S)
 		except Exception:
@@ -5407,7 +5468,7 @@ async def _restart_browser_inner(
 		reopen_pairs: list[tuple[Page, str]] = []
 		for extra_url in urls_to_reopen:
 			try:
-				new_page = await asyncio.wait_for(ctx_browser.new_page(), timeout=NEW_PAGE_TIMEOUT_S)
+				new_page = await session.new_background_page(ctx_browser)
 				reopen_pairs.append((new_page, extra_url))
 			except Exception:
 				pass
@@ -5480,7 +5541,7 @@ async def set_headless(
 	force: bool = False,
 	ctx: Optional[Context] = None,
 ) -> str:
-	"""Switch headless (default) vs headed mode; restarts Chromium on change (switching to headless refuses if non-blank tabs exist unless force=True). Prefer wait_for_human() for login/2FA."""
+	"""Switch headed (default) vs headless mode; restarts Chromium on change (switching to headless refuses if non-blank tabs exist unless force=True). Prefer wait_for_human() for login/2FA."""
 	client_key = _session_key(ctx)
 	async with session._lifecycle_lock:
 		pages: list[Page] = []

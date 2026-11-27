@@ -32,7 +32,6 @@ class FakePage:
 		self._title = title
 		self._closed = False
 		self._listeners: dict[str, list] = {}
-		self.brought_to_front = 0
 
 	def is_closed(self) -> bool:
 		return self._closed
@@ -47,9 +46,6 @@ class FakePage:
 		self.url = url
 		self._title = f"Title:{url}"
 		return FakeResponse(200)
-
-	async def bring_to_front(self):
-		self.brought_to_front += 1
 
 	async def evaluate(self, script, arg=None, isolated_context: bool = True):
 		return f"eval:{self.url}"
