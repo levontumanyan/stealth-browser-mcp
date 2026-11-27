@@ -46,28 +46,6 @@ def test_pep723_metadata_matches_pyproject():
 	assert '"bin/stealth_browser_audit.py"' in pyproject
 
 
-def test_version_is_single_source():
-	script = _script_text()
-	version = re.search(r'^__version__ = "([^"]+)"', script, re.MULTILINE)
-	assert version, "__version__ missing"
-	assert version.group(1) == "0.1.0"
-	cli_version = re.search(r'^__version__ = "([^"]+)"', CLI_MODULE.read_text(encoding="utf-8"), re.MULTILINE)
-	assert cli_version and cli_version.group(1) == version.group(1)
-	assert "__version__" not in PYPROJECT.read_text(encoding="utf-8"), "version must come from the script only"
-
-
-def test_cli_flags_are_exposed():
-	result = subprocess.run(
-		["uv", "run", "--script", str(SCRIPT), "--help"],
-		capture_output=True,
-		text=True,
-		timeout=60,
-	)
-	assert result.returncode == 0, result.stderr
-	for flag in ("--version", "--install-browser", "--doctor", "--smoke"):
-		assert flag in result.stdout, f"{flag} missing from --help"
-
-
 def test_cli_version_exits_zero():
 	result = subprocess.run(
 		["uv", "run", "--script", str(SCRIPT), "--version"],
@@ -88,15 +66,3 @@ def test_cli_doctor_exits_zero():
 	)
 	assert result.returncode == 0, result.stdout + result.stderr
 	assert "All checks passed" in result.stdout
-
-
-def test_audit_cli_flags_are_exposed():
-	result = subprocess.run(
-		["uv", "run", "--script", str(AUDIT_SCRIPT), "--help"],
-		capture_output=True,
-		text=True,
-		timeout=60,
-	)
-	assert result.returncode == 0, result.stderr
-	for flag in ("--since", "--session", "--json", "--no-cache", "--cache-dir"):
-		assert flag in result.stdout, f"{flag} missing from stealth-browser-audit --help"

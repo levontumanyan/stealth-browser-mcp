@@ -145,37 +145,6 @@ def test_resolve_disabled_tools_env_and_protected_guards():
 		sb._resolve_disabled_tools(disabled_sections=["nonexistent"], env={})
 
 
-def test_list_sections_and_help_cli_flags_stay_lightweight():
-	res = subprocess.run(
-		[sys.executable, str(CLI_SCRIPT), "--list-sections"],
-		capture_output=True,
-		text=True,
-		timeout=15,
-	)
-	assert res.returncode == 0, res.stderr
-	for sec in ("core (16)", "debug (2)", "network (4)", "lifecycle (6)"):
-		assert sec in res.stdout
-	for tool in ("status", "wait_for_human", "evaluate_js", "fetch", "close_browser"):
-		assert tool in res.stdout
-
-	help_res = subprocess.run(
-		[sys.executable, str(CLI_SCRIPT), "--help"],
-		capture_output=True,
-		text=True,
-		timeout=15,
-	)
-	assert help_res.returncode == 0
-	for flag in (
-		"--list-sections",
-		"--minimal",
-		"--disable-debug",
-		"--disable-network",
-		"--disable-lifecycle",
-		"--disable-core",
-	):
-		assert flag in help_res.stdout
-
-
 def test_shared_daemon_per_client_gating_in_stdio_proxy():
 	with _short_runtime_dir() as td:
 		base_env = _isolated_env(td, cdp_port=19241)

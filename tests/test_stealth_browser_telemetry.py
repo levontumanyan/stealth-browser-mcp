@@ -6,7 +6,6 @@ import os
 import time
 from pathlib import Path
 from typing import Any, Callable, Optional
-import pytest
 
 _SCRIPT_PATH = Path(__file__).resolve().parent.parent / "bin" / "stealth-browser"
 _loader = importlib.machinery.SourceFileLoader("stealth_browser", str(_SCRIPT_PATH))

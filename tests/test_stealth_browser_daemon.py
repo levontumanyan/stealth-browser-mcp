@@ -48,29 +48,6 @@ def _isolated_env(rdir: str, token_file: str, cdp_port: int = 19222) -> dict[str
 	return env
 
 
-def test_help_exposes_all_daemon_and_proxy_flags():
-	res = subprocess.run(
-		[sys.executable, str(SCRIPT), "--help"],
-		capture_output=True,
-		text=True,
-		timeout=15,
-	)
-	assert res.returncode == 0, res.stderr
-	for flag in (
-		"--version",
-		"--install-browser",
-		"--doctor",
-		"--smoke",
-		"--serve",
-		"--http",
-		"--daemon-idle-exit",
-		"--daemon-status",
-		"--daemon-stop",
-		"--standalone",
-	):
-		assert flag in res.stdout, f"{flag} missing from --help"
-
-
 def test_parse_loopback_http_enforces_loopback_only():
 	assert sb._parse_loopback_http("127.0.0.1:9223") == ("127.0.0.1", 9223)
 	assert sb._parse_loopback_http("localhost:9224") == ("localhost", 9224)

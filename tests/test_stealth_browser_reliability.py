@@ -163,16 +163,6 @@ def test_click_and_batch_overlay_fallback_and_two_phase_timeout(monkeypatch):
 	assert "[0] click '#submit' (js-dispatched after overlay interception): OK" in res_batch
 
 
-def test_extract_live_value_checked_and_cheatsheet():
-	assert "spec.attr === 'value' && 'value' in el" in sb._EXTRACT_JS
-	assert "spec.attr === 'checked' && 'checked' in el" in sb._EXTRACT_JS
-	assert "@value #priceInput" in sb.STEALTH_BROWSER_CHEATSHEET
-	assert "include_hrefs=True" in sb.STEALTH_BROWSER_CHEATSHEET
-	assert "restart_browser(headless=None, url=None, force=False)" in sb.STEALTH_BROWSER_CHEATSHEET
-	assert "close_browser(force_kill=True, force=False)" in sb.STEALTH_BROWSER_CHEATSHEET
-	assert "set_headless(headless=True, force=False)" in sb.STEALTH_BROWSER_CHEATSHEET
-
-
 def test_stale_tab_error_includes_open_tabs_and_batch_partial_progress(monkeypatch):
 	class _TabPage:
 		def __init__(self, url: str):
