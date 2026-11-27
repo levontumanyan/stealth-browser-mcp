@@ -4,7 +4,7 @@ Push a `v*` tag to release. Merging PRs or pushing to `main` only runs CI; nothi
 
 ## Steps
 
-1. Bump `__version__` in `bin/stealth_browser.py` (the sole version source; `pyproject.toml` reads it dynamically). Pick a version above the current PyPI release — PyPI versions are immutable.
+1. Bump `__version__` in `bin/stealth_browser.py` (the source for `pyproject.toml` and the MCP server) and in `bin/stealth_browser_cli.py` (the `stealth-browser --version` output). Pick a version above the current PyPI release — PyPI versions are immutable.
 2. Commit and push to `main`; wait for CI to pass.
 3. Push a tag matching the version:
 
