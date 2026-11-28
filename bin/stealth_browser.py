@@ -2,13 +2,14 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-# 	"mcp==1.30.0",
+# 	"mcp==2.3.0",
 # 	"patchright==1.64.4",
 # ]
 # ///
-"""FastMCP server providing browser automation tools over CDP / stealth Chromium using patchright."""
+"""MCP server providing browser automation tools over CDP / stealth Chromium using patchright."""
 
 __version__ = "0.1.1"
+_MCP_REQUIRED = "2.3.0"
 
 import os
 import sys
@@ -97,13 +98,13 @@ import zipfile
 from collections import deque
 from typing import Union
 from urllib.parse import urlparse
-from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from patchright.async_api import Browser, BrowserContext, Page, async_playwright
 
 try:
 	from pydantic import ConfigDict
-	import mcp.server.fastmcp.utilities.func_metadata as _fm
+	import mcp.server.mcpserver.utilities.func_metadata as _fm
 
 	class _StrictArgModel(_fm.ArgModelBase):
 		model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
@@ -155,16 +156,17 @@ STEALTH_BROWSER_CHEATSHEET = (
 	"- keep_alive(enable=True, tab=-1, min_seconds=45, max_seconds=90, ping_url=None, click_selector=None) | set_headless(headless=True, force=False) | restart_browser(headless=None, url=None, force=False) | close_browser(force_kill=True, force=False)"
 )
 
-mcp = FastMCP(
+_TRANSPORT_SECURITY = TransportSecuritySettings(
+	enable_dns_rebinding_protection=True,
+	allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*", "localhost", "127.0.0.1"],
+)
+
+mcp = MCPServer(
 	"stealth-browser",
+	version=__version__,
 	instructions=STEALTH_BROWSER_CHEATSHEET,
 	lifespan=_lifespan,
-	transport_security=TransportSecuritySettings(
-		enable_dns_rebinding_protection=True,
-		allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*", "localhost", "127.0.0.1"],
-	),
 )
-mcp._mcp_server.version = __version__
 
 
 @mcp.resource("instructions://cheatsheet")
@@ -5622,7 +5624,7 @@ def _doctor(smoke: bool = False) -> int:
 		from importlib.metadata import version as _dist_version
 
 		deps = {name: _dist_version(name) for name in ("mcp", "patchright")}
-		deps_ok = deps["mcp"] == "1.30.0"
+		deps_ok = deps["mcp"] == _MCP_REQUIRED
 		checks.append(("Dependencies", deps_ok, ", ".join(f"{k}={v}" for k, v in deps.items())))
 	except Exception as exc:
 		checks.append(("Dependencies", False, str(exc)))
@@ -5724,7 +5726,7 @@ async def _asgi_send_json(send, status_code: int, payload: dict, extra_headers: 
 
 
 class _DaemonUdsASGI:
-	def __init__(self, base_app, state: _DaemonState, mcp_app: FastMCP, lifespan_cm=None):
+	def __init__(self, base_app, state: _DaemonState, mcp_app: MCPServer, lifespan_cm=None):
 		self.base_app = base_app
 		self.state = state
 		self.mcp_app = mcp_app
@@ -5861,7 +5863,7 @@ def _serve_daemon(
 			pass
 
 	mcp._session_manager = None
-	base_app = mcp.streamable_http_app()
+	base_app = mcp.streamable_http_app(transport_security=_TRANSPORT_SECURITY)
 	state = _DaemonState(_script_sha256())
 
 	@contextlib.asynccontextmanager
@@ -5984,7 +5986,7 @@ def _serve_daemon(
 def _apply_tool_gating(
 	disabled_tools: frozenset[str],
 	gating_notice: str = "",
-	mcp_server: Optional[FastMCP] = None,
+	mcp_server: Optional[MCPServer] = None,
 ) -> list[str]:
 	target = mcp if mcp_server is None else mcp_server
 	removed: list[str] = []
@@ -5996,9 +5998,9 @@ def _apply_tool_gating(
 		except Exception:
 			pass
 	if gating_notice:
-		existing = target._mcp_server.instructions or ""
+		existing = target._lowlevel_server.instructions or ""
 		if gating_notice not in existing:
-			target._mcp_server.instructions = f"{existing}\n{gating_notice}" if existing else gating_notice
+			target._lowlevel_server.instructions = f"{existing}\n{gating_notice}" if existing else gating_notice
 	return removed
 
 

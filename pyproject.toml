@@ -13,7 +13,7 @@ authors = [
 	{name = "Levon Tumanyan"},
 ]
 dependencies = [
-	"mcp==1.30.0",
+	"mcp==2.3.0",
 	"patchright==1.64.4",
 ]
 

@@ -31,9 +31,12 @@ def test_pep723_metadata_matches_pyproject():
 	block = metadata.group(1)
 	pyproject = PYPROJECT.read_text(encoding="utf-8")
 
-	for package in ("mcp==1.30.0", "patchright==1.64.4"):
-		assert package in block, f"{package} missing from PEP 723 block"
-		assert package in pyproject, f"{package} missing from pyproject.toml"
+	pins = dict(re.findall(r'"([A-Za-z0-9_-]+)==([^"]+)"', pyproject))
+	assert pins, "no pinned dependencies found in pyproject.toml"
+	for package, version in pins.items():
+		pin = f"{package}=={version}"
+		assert pin in block, f"{pin} missing from PEP 723 block"
+		assert pin in pyproject, f"{pin} missing from pyproject.toml"
 	assert "adblock" not in block
 	assert "adblock" not in pyproject
 
