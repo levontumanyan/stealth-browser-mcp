@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from mcp.server.mcpserver import Context
 
 SCRIPT_PATH = Path(__file__).resolve().parent.parent / "bin" / "stealth-browser"
 
@@ -808,7 +809,7 @@ def test_mcp_tool_schemas_forbid_extra_params(sb):
 			("switch_tab", {"tab": 0, "tab_index": 0}),
 		):
 			try:
-				await sb.mcp._tool_manager.call_tool(name, bad_args, convert_result=False)
+				await sb.mcp._tool_manager.call_tool(name, bad_args, Context(mcp_server=sb.mcp), convert_result=False)
 				raise AssertionError(f"{name} accepted unknown params {bad_args}")
 			except Exception as exc:
 				assert "extra_forbidden" in str(exc) or "Extra inputs" in str(exc), f"{name}: {exc}"
@@ -819,7 +820,7 @@ def test_mcp_tool_schemas_forbid_extra_params(sb):
 def test_mcp_tool_call_unknown_param_error_names_offender(sb):
 	async def scenario():
 		try:
-			await sb.mcp._tool_manager.call_tool("close_tab", {"tab_index": 2}, convert_result=False)
+			await sb.mcp._tool_manager.call_tool("close_tab", {"tab_index": 2}, Context(mcp_server=sb.mcp), convert_result=False)
 			raise AssertionError("expected validation error")
 		except Exception as exc:
 			assert "tab_index" in str(exc), str(exc)

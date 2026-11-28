@@ -129,7 +129,7 @@ def _disabled_sections_from_args(args: argparse.Namespace) -> list[str]:
 def _build_arg_parser() -> argparse.ArgumentParser:
 	parser = argparse.ArgumentParser(
 		prog="stealth-browser",
-		description="FastMCP server providing browser automation tools over CDP or standalone stealth Chromium using patchright.",
+		description="MCP server providing browser automation tools over CDP or standalone stealth Chromium using patchright.",
 	)
 	parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
 	parser.add_argument("--install-browser", action="store_true", help="Download the Patchright Chromium build used by the stealth browser")

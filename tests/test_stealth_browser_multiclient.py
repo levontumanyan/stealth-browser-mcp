@@ -337,8 +337,8 @@ def test_mcp_tool_schemas_hide_ctx_and_bind_context_kwarg():
 	tools = asyncio.run(sb.mcp.list_tools())
 	assert len(tools) >= 26
 	for tool in tools:
-		props = tool.inputSchema.get("properties", {})
-		req = tool.inputSchema.get("required", [])
+		props = tool.input_schema.get("properties", {})
+		req = tool.input_schema.get("required", [])
 		assert "ctx" not in props, f"tool {tool.name} exposed ctx in inputSchema properties"
 		assert "ctx" not in req, f"tool {tool.name} exposed ctx in inputSchema required"
 
